@@ -131,20 +131,30 @@ function formatBar(bar, index) {
   const stars = bar.rating >= 9 ? '🌟' : bar.rating >= 7 ? '⭐' : '✨';
   const lines = [
     '*' + index + '. ' + bar.name + '*',
-    '',
     bar.rating ? stars + ' *' + bar.rating + '* (' + bar.reviews_count + ' отз.)' : '',
-    bar.avg_check ? '💰 Средний чек — ' + bar.avg_check + ' руб.' : '',
+    bar.avg_check ? '💰 ' + bar.avg_check + ' руб.' : '',
     bar.metro ? '🚇 ' + bar.metro + (bar.metro_distance_m ? ' · ' + bar.metro_distance_m + ' м' : '') : '',
     bar.cuisine?.length ? '🍽 ' + bar.cuisine.slice(0, 3).join(', ') : '',
-    '',
-    bar.description ? '_' + bar.description.slice(0, 160).trim() + (bar.description.length > 160 ? '…' : '') + '_' : '',
-    '',
-    bar.features?.length ? '✨ ' + bar.features.slice(0, 5).join(' · ') : '',
-    '',
-    bar.phone ? '📞 ' + bar.phone : '',
-    bar.url ? '[Подробнее на нашем сайте ↗](' + bar.url + ')' : '',
-  ].filter(x => x !== undefined);
-  return lines.join('\n\n');
+    bar.description ? '_' + bar.description.trim() + '_' : '',
+    bar.features?.length ? '✨ ' + bar.features.slice(0, 4).join(' · ') : '',
+    bar.phone ? '📞 [' + bar.phone + '](tel:' + bar.phone.replace(/[^+\d]/g, '') + ')' : '',
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+function cleanUrl(url) {
+  // Убираем utm-параметры для чистых ссылок на меню/отзывы
+  return url ? url.split('?')[0] : '';
+}
+
+function barInlineKeyboard(bar) {
+  const base = cleanUrl(bar.url);
+  const row1 = [];
+  const row2 = [];
+  if (bar.url) row1.push(Markup.button.url('🌐 На сайте', bar.url));
+  if (base) row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
+  if (base) row2.push(Markup.button.url('💬 Отзывы' + (bar.reviews_count ? ' (' + bar.reviews_count + ')' : ''), base + '/otzyvy'));
+  return Markup.inlineKeyboard([row1, row2]);
 }
 
 function hasValidPhoto(url) {
@@ -181,32 +191,67 @@ const MSG2 = [
 function rnd(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Wizard
-const WIZARD_Q = [
-  { key: 'location', text: '📍 *Где территориально?*\n\nМетро, район или округ — например, «Арбатская», «ЦАО».' },
-  { key: 'budget',   text: '💰 *Средний чек на человека?*\n\nНапример: «до 1500», «1500–3000», «не важно».' },
-  { key: 'guests',   text: '👥 *Сколько вас будет человек?*' },
-  { key: 'occasion', text: '🎉 *Тип мероприятия?*\n\nУжин, день рождения, корпоратив, свидание, детский праздник...' },
-  { key: 'features', text: '✨ *Какие особенности важны?*\n\nЖивая музыка, кальян, веранда, кабинки, парковка — или «без предпочтений».' },
-];
+// Wizard — 3 шага
 async function runWizard(ctx, userId) {
   const w = wizards[userId];
   if (!w) return;
-  if (w.step < WIZARD_Q.length) {
-    await ctx.replyWithMarkdown('Вопрос ' + (w.step+1) + ' из ' + WIZARD_Q.length + '\n\n' + WIZARD_Q[w.step].text, Markup.keyboard([['❌ Отмена']]).resize());
+
+  if (w.step === 0) {
+    await ctx.reply(
+      'Шаг 1 из 3 — Цель посещения\n\nВыберите или напишите своими словами:',
+      Markup.keyboard([
+        ['🍻 Выпить в баре или пабе'],
+        ['🤫 Пообщаться в тишине'],
+        ['🎤 Спеть в караоке'],
+        ['🕺 Потанцевать под DJ-сеты'],
+        ['🎸 Послушать живую музыку'],
+        ['👶 Пойти с детьми'],
+        ['🎂 Отметить день рождения'],
+        ['💼 Деловая встреча / бизнес'],
+        ['❌ Отмена'],
+      ]).resize()
+    );
+  } else if (w.step === 1) {
+    await ctx.reply(
+      'Шаг 2 из 3 — Где искать?\n\nВыберите округ или напишите название станции метро:',
+      Markup.keyboard([
+        ['ЦАО', 'ЗАО'],
+        ['САО', 'ЮЗАО'],
+        ['ЮАО', 'СВАО'],
+        ['ВАО', 'ЮВАО'],
+        ['СЗАО'],
+        ['❌ Отмена'],
+      ]).resize()
+    );
+  } else if (w.step === 2) {
+    await ctx.reply(
+      'Шаг 3 из 3 — Средний чек на человека:',
+      Markup.keyboard([
+        ['до 1 000 руб.'],
+        ['1 000 – 1 500 руб.'],
+        ['1 500 – 2 000 руб.'],
+        ['2 000 – 3 000 руб.'],
+        ['от 3 000 руб.'],
+        ['Не важно'],
+        ['❌ Отмена'],
+      ]).resize()
+    );
   } else {
+    // Все 3 ответа собраны
     delete wizards[userId];
-    const { location, budget, occasion, features, guests } = w.answers;
-    const query = [
-      location !== 'не важно' ? location : '',
-      occasion && occasion !== 'обычный ужин' && occasion !== 'не важно' ? occasion : '',
-      features && features !== 'без предпочтений' ? features : '',
-      budget && budget !== 'не важно' ? 'бюджет ' + budget : '',
-      guests ? 'компания ' + guests + ' человек' : '',
-    ].filter(Boolean).join(', ');
-    await ctx.reply('Отлично, ищу: ' + query);
+    const { occasion, location, budget } = w.answers;
+    const parts = [];
+    if (occasion && !occasion.includes('Отмена')) parts.push(occasion.replace(/^[^\s]+ /, ''));
+    if (location && !['Не важно','❌ Отмена'].includes(location)) parts.push('район ' + location);
+    if (budget && budget !== 'Не важно') parts.push('бюджет ' + budget);
+    const query = parts.join(', ');
+    await ctx.reply('Отлично, подбираю: ' + query);
     const intent = await parseIntent(query);
-    sessions[userId] = { params: buildParams(intent), page: 1, lastQuery: query };
+    // Округа → параметр location[okrug]
+    const okrugMap = { 'ЦАО':11,'ЗАО':38,'САО':31,'ЮЗАО':3,'ЮАО':34,'СВАО':8,'ВАО':77,'ЮВАО':82,'СЗАО':28 };
+    const params = buildParams(intent);
+    if (okrugMap[location]) params['location[okrug][]'] = okrugMap[location];
+    sessions[userId] = { params, page: 1, lastQuery: query };
     await showResults(ctx, userId);
   }
 }
@@ -286,10 +331,11 @@ async function showResults(ctx, userId) {
   for (let i = 0; i < sorted.length; i++) {
     const bar  = sorted[i];
     const text = formatBar(bar, offset + i + 1);
+    const kb = barInlineKeyboard(bar);
     if (hasValidPhoto(bar.photo_url)) {
-      try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown' }); continue; } catch (e) {}
+      try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch (e) {}
     }
-    await ctx.replyWithMarkdown(text, { disable_web_page_preview: true });
+    await ctx.replyWithMarkdown(text, { disable_web_page_preview: true, ...kb });
   }
 
   const hasMore = session.page < lastPage;
@@ -314,6 +360,31 @@ async function showResults(ctx, userId) {
     }, 10000);
   }
 }
+
+// Callback — кнопка «Отзывы»
+bot.action(/^reviews_(.+)$/, async ctx => {
+  await ctx.answerCbQuery();
+  const barId = ctx.match[1];
+  try {
+    const resp = await api.get('/search', { params: { term: '', page: 1, per_page: 50 } });
+    const bars = resp.data.data || [];
+    const bar = bars.find(b => String(b.id) === barId);
+    if (bar && bar.reviews_count) {
+      const label = bar.rating >= 9 ? 'Идеально' : bar.rating >= 7 ? 'Отлично' : 'Хорошо';
+      await ctx.reply(
+        '💬 *' + bar.name + '*\n\n' +
+        '⭐ Рейтинг: *' + bar.rating + '*  (' + label + ')\n' +
+        '📝 Всего отзывов: *' + bar.reviews_count + '*\n\n' +
+        'Читайте все отзывы на сайте 👇',
+        { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.url('Читать отзывы на GdeBar.ru', bar.url)]]) }
+      );
+    } else {
+      await ctx.reply('Отзывы пока недоступны для этого заведения.');
+    }
+  } catch (e) {
+    await ctx.reply('Не удалось загрузить отзывы. Попробуйте открыть страницу заведения на сайте.');
+  }
+});
 
 // Основной обработчик
 bot.on('text', async ctx => {
@@ -359,7 +430,8 @@ bot.on('text', async ctx => {
 
   // Wizard — сбор ответов
   if (wizards[userId]) {
-    wizards[userId].answers[WIZARD_Q[wizards[userId].step].key] = text;
+    const stepKeys = ['occasion', 'location', 'budget'];
+    wizards[userId].answers[stepKeys[wizards[userId].step]] = text;
     wizards[userId].step++;
     return await runWizard(ctx, userId);
   }
