@@ -490,6 +490,12 @@ bot.on('text', async ctx => {
     return await runWizard(ctx, userId);
   }
 
+  // Популярные кнопки — сразу в wizard со step 1 (бюджет)
+  if (POPULAR.includes(text)) {
+    wizards[userId] = { step: 1, answers: { occasion: text } };
+    return await runWizard(ctx, userId);
+  }
+
   // Пагинация
   if (text === '📄 Показать ещё' && sessions[userId]) {
     sessions[userId].page++;
