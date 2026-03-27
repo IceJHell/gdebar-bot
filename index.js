@@ -131,15 +131,20 @@ function formatBar(bar, index) {
   const stars = bar.rating >= 9 ? '🌟' : bar.rating >= 7 ? '⭐' : '✨';
   const lines = [
     '*' + index + '. ' + bar.name + '*',
+    '',
     bar.rating ? stars + ' *' + bar.rating + '* (' + bar.reviews_count + ' отз.)' : '',
-    [bar.avg_check ? '💰 ' + bar.avg_check + ' руб.' : '', bar.metro ? '🚇 ' + bar.metro + (bar.metro_distance_m ? ' · ' + bar.metro_distance_m + ' м' : '') : ''].filter(Boolean).join('   '),
+    bar.avg_check ? '💰 Средний чек — ' + bar.avg_check + ' руб.' : '',
+    bar.metro ? '🚇 ' + bar.metro + (bar.metro_distance_m ? ' · ' + bar.metro_distance_m + ' м' : '') : '',
     bar.cuisine?.length ? '🍽 ' + bar.cuisine.slice(0, 3).join(', ') : '',
-    bar.description ? '\n_' + bar.description.slice(0, 130).trim() + (bar.description.length > 130 ? '…' : '') + '_' : '',
+    '',
+    bar.description ? '_' + bar.description.slice(0, 160).trim() + (bar.description.length > 160 ? '…' : '') + '_' : '',
+    '',
     bar.features?.length ? '✨ ' + bar.features.slice(0, 5).join(' · ') : '',
+    '',
     bar.phone ? '📞 ' + bar.phone : '',
-    bar.url ? '[Открыть на GdeBar.ru ↗](' + bar.url + ')' : '',
-  ].filter(Boolean);
-  return lines.join('\n');
+    bar.url ? '[Подробнее на нашем сайте ↗](' + bar.url + ')' : '',
+  ].filter(x => x !== undefined);
+  return lines.join('\n\n');
 }
 
 function hasValidPhoto(url) {
@@ -225,13 +230,17 @@ function mainKeyboard() {
 
 // Команды
 bot.start(async ctx => {
-  await ctx.replyWithMarkdown(
-    '👋 Привет! Помогу найти ресторан, кафе или бар в Москве и Петербурге.\n\nНапишите что ищете — или выберите подборку 👇',
-    mainKeyboard()
+  await ctx.reply(
+    'Привет! 👋\n\n' +
+    'Меня зовут Алекс, я помогаю подбирать рестораны, кафе и бары в Москве и Санкт-Петербурге.\n\n' +
+    'На сайте GdeBar.ru собраны тысячи заведений — с меню, фото, отзывами и возможностью забронировать столик онлайн. ' +
+    'Я помогу быстро найти то, что подойдёт именно вам — по настроению, бюджету и компании.\n\n' +
+    'Для начала скажите: вы ищете в каком городе?',
+    Markup.keyboard([['🏙 Москва', '🌊 Санкт-Петербург']]).resize()
   );
 });
 bot.help(ctx => ctx.reply(
-  'Напишите запрос в свободной форме или выберите подборку.\nМожно указать: метро, кухню, бюджет, особенности.'
+  'Напишите что ищете в свободной форме или выберите подборку.\nМожно указать: метро, кухню, бюджет, особенности.'
 ));
 
 // Показ результатов
@@ -285,17 +294,50 @@ async function showResults(ctx, userId) {
 
   const hasMore = session.page < lastPage;
   await ctx.reply(
-    'Вот что подобрал — ' + total + ' заведений, показываю лучшие.\nПереходите по ссылке: там меню, фото и отзывы 👆',
+    'Вот что подобрал — ' + total + ' заведений по вашему запросу, показываю лучшие.',
     hasMore
       ? Markup.keyboard([['📄 Показать ещё'], ['🔄 Новый поиск']]).resize()
       : Markup.keyboard([['🔄 Новый поиск']]).resize()
   );
+
+  // Отложенное сообщение через 10 секунд
+  if (isFirst) {
+    setTimeout(async () => {
+      try {
+        await ctx.reply(
+          'Кстати, советую не останавливаться только на фото 🙂\n\n' +
+          'На сайте каждого заведения вы найдёте полное меню, живые отзывы, актуальные фото и форму бронирования. ' +
+          'Если уже присмотрели что-то — звоните напрямую по номеру телефона или бронируйте столик онлайн прямо там.\n\n' +
+          'Если ни один вариант не подошёл — напишите, что не так, подберём другое 👇'
+        );
+      } catch (e) { /* пользователь мог уйти */ }
+    }, 10000);
+  }
 }
 
 // Основной обработчик
 bot.on('text', async ctx => {
   const userId = ctx.from.id;
   const text   = ctx.message.text;
+
+  // Выбор города
+  if (text === '🏙 Москва' || text === '🌊 Санкт-Петербург') {
+    const city = text === '🌊 Санкт-Петербург' ? 'spb' : 'msk';
+    sessions[userId] = { params: city === 'spb' ? { city: 'spb' } : {}, page: 1, lastQuery: '', city };
+    const cityName = city === 'spb' ? 'Петербурге' : 'Москве';
+    await ctx.reply(
+      'Отлично, ищем в ' + cityName + '! 🗺\n\n' +
+      'Куда бы вы хотели пойти? Можете написать своими словами или выбрать из популярного:\n\n' +
+      '• Романтический ужин на двоих\n' +
+      '• Бар с живой музыкой после работы\n' +
+      '• Ресторан для дня рождения компанией\n' +
+      '• Кафе с детьми на выходных\n' +
+      '• Деловой обед или бизнес-встреча\n' +
+      '• Место с верандой и свежим воздухом',
+      mainKeyboard()
+    );
+    return;
+  }
 
   // Ответ на уточняющий вопрос
   if (sessions[userId]?.pendingClarify && !wizards[userId] && text !== '🔄 Новый поиск' && text !== '❌ Отмена') {
