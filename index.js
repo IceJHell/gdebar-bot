@@ -191,41 +191,37 @@ const MSG2 = [
 function rnd(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Wizard — 3 шага
+// Wizard — пошаговый подбор
 async function runWizard(ctx, userId) {
   const w = wizards[userId];
   if (!w) return;
 
   if (w.step === 0) {
+    // Шаг 1: цель
     await ctx.reply(
-      'Шаг 1 из 3 — Цель посещения\n\nВыберите или напишите своими словами:',
+      'Хорошо, давайте подберём вместе! \n\nКуда хотите пойти?',
       Markup.keyboard([
         ['🍻 Выпить в баре или пабе'],
-        ['🤫 Пообщаться в тишине'],
+        ['🤫 Спокойно поговорить'],
         ['🎤 Спеть в караоке'],
-        ['🕺 Потанцевать под DJ-сеты'],
+        ['🕺 Потанцевать под DJ'],
         ['🎸 Послушать живую музыку'],
         ['👶 Пойти с детьми'],
         ['🎂 Отметить день рождения'],
-        ['💼 Деловая встреча / бизнес'],
+        ['💼 Деловая встреча'],
+        ['🍽 Просто вкусно поесть'],
         ['❌ Отмена'],
       ]).resize()
     );
+
   } else if (w.step === 1) {
-    await ctx.reply(
-      'Шаг 2 из 3 — Где искать?\n\nВыберите округ или напишите название станции метро:',
-      Markup.keyboard([
-        ['ЦАО', 'ЗАО'],
-        ['САО', 'ЮЗАО'],
-        ['ЮАО', 'СВАО'],
-        ['ВАО', 'ЮВАО'],
-        ['СЗАО'],
-        ['❌ Отмена'],
-      ]).resize()
-    );
-  } else if (w.step === 2) {
-    await ctx.reply(
-      'Шаг 3 из 3 — Средний чек на человека:',
+    // Шаг 2: бюджет (зависит от цели)
+    const occasion = w.answers.occasion || '';
+    let q = 'Понял! А какой примерно бюджет на человека?';
+    if (occasion.includes('день рождения')) q = 'Отлично, именины — это всегда приятно 🎉\n\nКакой бюджет на человека планируете?';
+    else if (occasion.includes('Деловая')) q = 'Деловой формат — тогда важно место с атмосферой.\n\nКакой бюджет на человека?';
+    else if (occasion.includes('детьми')) q = 'С детьми — главное чтобы было комфортно 👶\n\nКакой бюджет на человека?';
+    await ctx.reply(q,
       Markup.keyboard([
         ['до 1 000 руб.'],
         ['1 000 – 1 500 руб.'],
@@ -236,18 +232,31 @@ async function runWizard(ctx, userId) {
         ['❌ Отмена'],
       ]).resize()
     );
+
+  } else if (w.step === 2) {
+    // Шаг 3: район / метро
+    await ctx.reply(
+      'Почти готово! \n\nВ каком районе ищем? Выберите округ или напишите станцию метро:',
+      Markup.keyboard([
+        ['ЦАО', 'ЗАО', 'САО'],
+        ['ЮЗАО', 'ЮАО', 'СВАО'],
+        ['ВАО', 'ЮВАО', 'СЗАО'],
+        ['Не важно'],
+        ['❌ Отмена'],
+      ]).resize()
+    );
+
   } else {
-    // Все 3 ответа собраны
+    // Все ответы собраны — ищем
     delete wizards[userId];
-    const { occasion, location, budget } = w.answers;
+    const { occasion, budget, location } = w.answers;
     const parts = [];
-    if (occasion && !occasion.includes('Отмена')) parts.push(occasion.replace(/^[^\s]+ /, ''));
-    if (location && !['Не важно','❌ Отмена'].includes(location)) parts.push('район ' + location);
+    if (occasion && !occasion.includes('Отмена')) parts.push(occasion.replace(/^[\S]+ /, ''));
     if (budget && budget !== 'Не важно') parts.push('бюджет ' + budget);
+    if (location && !['Не важно', '❌ Отмена'].includes(location)) parts.push(location);
     const query = parts.join(', ');
-    await ctx.reply('Отлично, подбираю: ' + query);
+    await ctx.reply('Ищу для вас — ' + query + ' 🔍');
     const intent = await parseIntent(query);
-    // Округа → параметр location[okrug]
     const okrugMap = { 'ЦАО':11,'ЗАО':38,'САО':31,'ЮЗАО':3,'ЮАО':34,'СВАО':8,'ВАО':77,'ЮВАО':82,'СЗАО':28 };
     const params = buildParams(intent);
     if (okrugMap[location]) params['location[okrug][]'] = okrugMap[location];
@@ -310,8 +319,47 @@ async function showResults(ctx, userId) {
   const lastPage = meta.last_page || 1;
 
   if (allBars.length === 0) {
+    // Пробуем без самого ограничивающего параметра
+    const relaxedParams = { ...session.params };
+    let relaxedMsg = '';
+    if (relaxedParams['middleCheck[to]']) {
+      delete relaxedParams['middleCheck[to]'];
+      delete relaxedParams['middleCheck[from]'];
+      relaxedMsg = 'чуть расширю бюджет';
+    } else if (relaxedParams['metro[]']) {
+      delete relaxedParams['metro[]'];
+      relaxedMsg = 'расширю до всего района';
+    } else if (relaxedParams['kitchen[]']) {
+      delete relaxedParams['kitchen[]'];
+      relaxedMsg = 'уберу фильтр по кухне';
+    }
+
+    if (relaxedMsg) {
+      const retry = await api.get('/search', { params: { ...relaxedParams, page: 1, per_page: 6 } });
+      const retryBars = retry.data.data || [];
+      if (retryBars.length > 0) {
+        await ctx.reply('По точному запросу не нашлось — ' + relaxedMsg + ' и смотрю шире 🔍');
+        session.params = relaxedParams;
+        // продолжаем с найденными результатами
+        const withPhone = retryBars.filter(b => b.phone);
+        const withoutPhone = retryBars.filter(b => !b.phone);
+        const sorted2 = [...withPhone, ...withoutPhone].slice(0, 3);
+        if (isFirst) { trackQuery(ctx, session.lastQuery || '', sorted2.length); await ctx.reply(rnd(MSG2)); await ctx.sendChatAction('typing'); await sleep(2000); }
+        const offset2 = 0;
+        for (let i = 0; i < sorted2.length; i++) {
+          const bar = sorted2[i]; const text2 = formatBar(bar, i + 1);
+          const kb2 = barInlineKeyboard(bar);
+          if (hasValidPhoto(bar.photo_url)) { try { await ctx.replyWithPhoto(bar.photo_url, { caption: text2, parse_mode: 'Markdown', ...kb2 }); continue; } catch(e) {} }
+          await ctx.replyWithMarkdown(text2, { disable_web_page_preview: true, ...kb2 });
+        }
+        await ctx.reply('Нашёл ' + retry.data.meta?.total + ' заведений с чуть расширенными параметрами — показываю лучшие.',
+          Markup.keyboard([['📄 Показать ещё'], ['🔄 Новый поиск']]).resize());
+        return;
+      }
+    }
+
     return ctx.reply(
-      '😕 По вашему запросу ничего не нашлось.\n\nПопробуйте убрать ограничение по бюджету, сменить метро или упростить запрос.\nИли нажмите «Задай мне 5 вопросов» 👇',
+      'Хм, по таким параметрам пока ничего не нашлось 🤔\n\nПопробуйте что-то изменить — например, другой район или бюджет. Или давайте подберём вместе:',
       Markup.keyboard([['🤔 Задай мне 5 вопросов'], ['🔄 Новый поиск']]).resize()
     );
   }
@@ -430,7 +478,7 @@ bot.on('text', async ctx => {
 
   // Wizard — сбор ответов
   if (wizards[userId]) {
-    const stepKeys = ['occasion', 'location', 'budget'];
+    const stepKeys = ['occasion', 'budget', 'location'];
     wizards[userId].answers[stepKeys[wizards[userId].step]] = text;
     wizards[userId].step++;
     return await runWizard(ctx, userId);
