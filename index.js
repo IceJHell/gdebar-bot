@@ -24,10 +24,10 @@ async function loadCache() {
       api.get('/types'),
       api.get('/good-for'),
     ]);
-    CACHE.metros   = metros.data.data   || [];
-    CACHE.kitchens = kitchens.data.data || [];
-    CACHE.types    = types.data.data    || [];
-    CACHE.goodFor  = goodFor.data.data  || [];
+    CACHE.metros   = Array.isArray(metros.data)   ? metros.data   : (metros.data.data   || []);
+    CACHE.kitchens = Array.isArray(kitchens.data) ? kitchens.data : (kitchens.data.data || []);
+    CACHE.types    = Array.isArray(types.data)    ? types.data    : (types.data.data    || []);
+    CACHE.goodFor  = Array.isArray(goodFor.data)  ? goodFor.data  : (goodFor.data.data  || []);
     console.log('✅ Справочники загружены:', {
       metros: CACHE.metros.length,
       kitchens: CACHE.kitchens.length,
