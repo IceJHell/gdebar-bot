@@ -28,17 +28,36 @@ async function apiGet(url, params, retries = 2) {
 // ─── Справочники ──────────────────────────────────────────────────────────────
 let CACHE = { metros: [], kitchens: [], types: [], goodFor: [] };
 
+async function fetchOne(url, timeout = 60000) {
+  const resp = await api.get(url, { timeout });
+  return Array.isArray(resp.data) ? resp.data : (resp.data.data || []);
+}
+
 async function loadCache() {
-  try {
-    const [metros, kitchens, types, goodFor] = await Promise.all([
-      api.get('/metros'), api.get('/kitchens'), api.get('/types'), api.get('/good-for'),
-    ]);
-    CACHE.metros   = Array.isArray(metros.data)   ? metros.data   : (metros.data.data   || []);
-    CACHE.kitchens = Array.isArray(kitchens.data) ? kitchens.data : (kitchens.data.data || []);
-    CACHE.types    = Array.isArray(types.data)    ? types.data    : (types.data.data    || []);
-    CACHE.goodFor  = Array.isArray(goodFor.data)  ? goodFor.data  : (goodFor.data.data  || []);
-    console.log('Справочники:', { metros: CACHE.metros.length, kitchens: CACHE.kitchens.length, types: CACHE.types.length });
-  } catch (e) { console.error('Ошибка справочников:', e.message); }
+  console.log('Загружаю справочники...');
+  // Грузим каждый по отдельности с повторами чтобы не упасть всем сразу
+  const load = async (url, key) => {
+    for (let i = 1; i <= 5; i++) {
+      try {
+        const data = await fetchOne(url, 60000);
+        CACHE[key] = data;
+        console.log(key + ': ' + data.length);
+        return;
+      } catch(e) {
+        console.log(key + ' попытка ' + i + ' не удалась, жду 10 сек...');
+        await new Promise(r => setTimeout(r, 10000));
+      }
+    }
+    console.error(key + ': не удалось загрузить после 5 попыток');
+  };
+
+  await Promise.all([
+    load('/metros', 'metros'),
+    load('/kitchens', 'kitchens'),
+    load('/types', 'types'),
+    load('/good-for', 'goodFor'),
+  ]);
+  console.log('Итого:', { metros: CACHE.metros.length, kitchens: CACHE.kitchens.length, types: CACHE.types.length, goodFor: CACHE.goodFor.length });
 }
 
 // ─── Избранное (Feature 1) ────────────────────────────────────────────────────
@@ -322,7 +341,18 @@ async function runWizard(ctx, userId) {
 }
 
 // ─── Популярные подборки ──────────────────────────────────────────────────────
-const POPULAR = ['🍷 Романтический ужин','🍻 Бар с живой музыкой','🌿 С верандой','👶 С детьми','🎤 Кальян','🌅 Панорамный вид','🎸 Живая музыка','🍣 Японская кухня','🥩 Стейк-хаус','☕ Кофейня'];
+const POPULAR = [
+  '👫 Пойти с друзьями',
+  '🚶 Погулять в центре',
+  '🍷 Романтический ужин',
+  '👶 С детьми',
+  '💼 Деловая встреча',
+  '🍻 Выпить после работы',
+  '🎂 Отметить праздник',
+  '🌿 На свежем воздухе',
+  '🎸 Живая музыка',
+  '🍣 Куда-нибудь необычное',
+];
 
 function mainKeyboard() {
   return Markup.keyboard([...POPULAR.map(p => [p]), ['🟢 Открыто сейчас','🤔 Задай мне 5 вопросов'], ['📋 Мои подписки','❤️ Избранное'], ['🔄 Новый поиск']]).resize();
@@ -552,7 +582,7 @@ bot.on('text', async ctx => {
   if (text === '🏙 Москва' || text === '🌊 Санкт-Петербург') {
     const city = text === '🌊 Санкт-Петербург' ? 'spb' : 'msk';
     sessions[userId] = { params: city === 'spb' ? { city: 'spb' } : {}, page: 1, lastQuery: '', city };
-    await ctx.reply('Отлично, ищем в ' + (city === 'spb' ? 'Петербурге' : 'Москве') + '! 🗺\n\nКуда хотите пойти? Можете написать своими словами или выбрать из популярного:\n\n• Романтический ужин на двоих\n• Бар с живой музыкой после работы\n• Кафе с детьми\n• Деловой обед\n• Место с верандой', mainKeyboard());
+    await ctx.reply('Отлично, ищем в ' + (city === 'spb' ? 'Петербурге' : 'Москве') + '! 🗺\n\nКуда хотите пойти? Напишите своими словами — или выберите из популярного:\n\n• Куда пойти с друзьями вечером\n• Погулять и зайти куда-нибудь в центре\n• Хочу что-то вкусное рядом с домом\n• Просто посидеть в хорошем месте\n• Куда сходить на выходных', mainKeyboard());
     return;
   }
 
@@ -729,6 +759,12 @@ cron.schedule('0 10 * * 0', async () => {
 }, { timezone: 'Europe/Moscow' });
 
 // ─── Старт ────────────────────────────────────────────────────────────────────
-loadCache().then(() => { bot.launch(); console.log('GdeBar бот запущен'); });
+// Запускаем бота сразу, справочники грузятся в фоне
+bot.launch();
+console.log('GdeBar бот запущен');
+loadCache(); // фоновая загрузка
+
+// Перезагружаем справочники каждые 6 часов
+setInterval(loadCache, 6 * 60 * 60 * 1000);
 process.once('SIGINT',  () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
