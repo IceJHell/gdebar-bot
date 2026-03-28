@@ -425,9 +425,20 @@ async function showResults(ctx, userId) {
   const offset = (session.page - 1) * 3;
   for (let i = 0; i < sorted.length; i++) {
     const bar = sorted[i]; barCache[bar.id] = bar;
-    const text = formatBar(bar, offset+i+1); const kb = barInlineKeyboard(bar);
-    if (hasValidPhoto(bar.photo_url)) { try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch(e) {} }
-    await ctx.replyWithMarkdown(text, { disable_web_page_preview: true, ...kb });
+    const text = formatBar(bar, offset+i+1);
+    try {
+      const kb = barInlineKeyboard(bar);
+      if (hasValidPhoto(bar.photo_url)) {
+        try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch(e) {}
+      }
+      await ctx.replyWithMarkdown(text, { disable_web_page_preview: true, ...kb });
+    } catch(e) {
+      // fallback без инлайн кнопок если 400
+      if (hasValidPhoto(bar.photo_url)) {
+        try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown' }); continue; } catch(e2) {}
+      }
+      await ctx.replyWithMarkdown(text, { disable_web_page_preview: true });
+    }
   }
 
   const hasMore = session.page < lastPage;
@@ -502,7 +513,7 @@ bot.command('subscribe', async ctx => {
   }
   const text = '📬 *Ваши подписки:*\n\n' + userSubs.map((s,i) => (i+1) + '. ' + s.label).join('\n');
   await ctx.replyWithMarkdown(text, Markup.inlineKeyboard(
-    userSubs.map(s => [Markup.button.callback('❌ Отписаться: ' + s.label.slice(0,20), 'unsub_' + encodeURIComponent(s.label))])
+    userSubs.map((s,i) => [Markup.button.callback('❌ ' + s.label.slice(0,25), 'unsub_' + i)])
   ));
 });
 
@@ -566,11 +577,16 @@ bot.action(/^similar_(\d+)$/, async ctx => {
 });
 
 // Отписка
-bot.action(/^unsub_(.+)$/, async ctx => {
+bot.action(/^unsub_(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
-  const label = decodeURIComponent(ctx.match[1]);
-  removeSub(ctx.from.id, label);
-  await ctx.reply('Отписались от: ' + label);
+  const idx = parseInt(ctx.match[1]);
+  const subs = loadSubs();
+  const userSubs = subs[ctx.from.id] || [];
+  if (userSubs[idx]) {
+    const label = userSubs[idx].label;
+    removeSub(ctx.from.id, label);
+    await ctx.reply('Отписались от: ' + label);
+  }
 });
 
 // ─── Основной обработчик ──────────────────────────────────────────────────────
