@@ -287,7 +287,7 @@ function barInlineKeyboard(bar) {
   if (bar.url) row1.push(Markup.button.url('🌐 На сайте', bar.url));
   if (base) row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
   if (base) row2.push(Markup.button.url('💬 Отзывы' + (bar.reviews_count ? ' (' + bar.reviews_count + ')' : ''), base + '/otzyvy'));
-  row2.push(Markup.button.callback('❤️ В избранное', 'fav_' + bar.id + '_' + encodeURIComponent(bar.name.slice(0, 30))));
+  row2.push(Markup.button.callback('❤️ В избранное', 'fav_' + bar.id));
   if (bar.cuisine && bar.cuisine.length) row2.push(Markup.button.callback('🔁 Похожие', 'similar_' + bar.id));
   return Markup.inlineKeyboard([row1, row2]);
 }
@@ -527,7 +527,7 @@ bot.command('report', async ctx => {
 // ─── Callback кнопки ──────────────────────────────────────────────────────────
 
 // Избранное — добавить
-bot.action(/^fav_(\d+)_(.+)$/, async ctx => {
+bot.action(/^fav_(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
   const barId = parseInt(ctx.match[1]);
   const bar = barCache[barId];
