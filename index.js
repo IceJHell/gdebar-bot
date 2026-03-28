@@ -775,12 +775,38 @@ cron.schedule('0 10 * * 0', async () => {
 }, { timezone: 'Europe/Moscow' });
 
 // ─── Старт ────────────────────────────────────────────────────────────────────
-// Запускаем бота сразу, справочники грузятся в фоне
-bot.launch();
-console.log('GdeBar бот запущен');
-loadCache(); // фоновая загрузка
-
-// Перезагружаем справочники каждые 6 часов
-setInterval(loadCache, 6 * 60 * 60 * 1000);
 process.once('SIGINT',  () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// Перехватываем необработанные ошибки чтобы не крашиться
+process.on('uncaughtException', (e) => {
+  console.error('uncaughtException:', e.message);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('unhandledRejection:', e && e.message ? e.message : e);
+});
+
+async function startBot() {
+  let attempt = 0;
+  while (true) {
+    try {
+      attempt++;
+      console.log('Запуск бота, попытка ' + attempt);
+      await bot.launch();
+    } catch(e) {
+      if (e.message && e.message.includes('409')) {
+        console.log('409 конфликт — жду 5 сек и перезапускаю...');
+        await new Promise(r => setTimeout(r, 5000));
+      } else {
+        console.error('Ошибка запуска:', e.message);
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+  }
+}
+
+console.log('GdeBar бот запускается...');
+loadCache();
+setInterval(loadCache, 6 * 60 * 60 * 1000);
+startBot();
+
