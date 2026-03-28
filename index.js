@@ -2,6 +2,8 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const cron = require('node-cron');
+const fs = require('fs');
+const path = require('path');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const API_BASE = 'https://www.gdebar.ru/api/v1';
@@ -9,11 +11,21 @@ const API_TOKEN = process.env.GDEBAR_API_TOKEN;
 
 const api = axios.create({
   baseURL: API_BASE,
-  headers: { Authorization: `Bearer ${API_TOKEN}` },
-  timeout: 10000,
+  headers: { Authorization: 'Bearer ' + API_TOKEN },
+  timeout: 30000,
 });
 
-// Справочники
+async function apiGet(url, params, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try { return await api.get(url, { params }); }
+    catch (e) {
+      if (i === retries) throw e;
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+}
+
+// ─── Справочники ──────────────────────────────────────────────────────────────
 let CACHE = { metros: [], kitchens: [], types: [], goodFor: [] };
 
 async function loadCache() {
@@ -25,13 +37,106 @@ async function loadCache() {
     CACHE.kitchens = Array.isArray(kitchens.data) ? kitchens.data : (kitchens.data.data || []);
     CACHE.types    = Array.isArray(types.data)    ? types.data    : (types.data.data    || []);
     CACHE.goodFor  = Array.isArray(goodFor.data)  ? goodFor.data  : (goodFor.data.data  || []);
-    console.log('Справочники загружены:', { metros: CACHE.metros.length, kitchens: CACHE.kitchens.length, types: CACHE.types.length, goodFor: CACHE.goodFor.length });
-  } catch (e) {
-    console.error('Ошибка загрузки справочников:', e.message);
+    console.log('Справочники:', { metros: CACHE.metros.length, kitchens: CACHE.kitchens.length, types: CACHE.types.length });
+  } catch (e) { console.error('Ошибка справочников:', e.message); }
+}
+
+// ─── Избранное (Feature 1) ────────────────────────────────────────────────────
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
+const FAV_FILE = path.join(DATA_DIR, 'favorites.json');
+
+function loadFavorites() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(FAV_FILE)) return {};
+    return JSON.parse(fs.readFileSync(FAV_FILE, 'utf8'));
+  } catch (e) { return {}; }
+}
+
+function saveFavorites(data) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(FAV_FILE, JSON.stringify(data, null, 2));
+  } catch (e) { console.error('Ошибка сохранения избранного:', e.message); }
+}
+
+function addFavorite(userId, bar) {
+  const favs = loadFavorites();
+  if (!favs[userId]) favs[userId] = [];
+  if (!favs[userId].find(b => b.id === bar.id)) {
+    favs[userId].unshift({ id: bar.id, name: bar.name, url: bar.url, metro: bar.metro, avg_check: bar.avg_check, savedAt: new Date().toLocaleDateString('ru-RU') });
+    if (favs[userId].length > 20) favs[userId] = favs[userId].slice(0, 20);
+    saveFavorites(favs);
+    return true;
+  }
+  return false;
+}
+
+function getFavorites(userId) {
+  const favs = loadFavorites();
+  return favs[userId] || [];
+}
+
+function removeFavorite(userId, barId) {
+  const favs = loadFavorites();
+  if (favs[userId]) {
+    favs[userId] = favs[userId].filter(b => b.id !== parseInt(barId));
+    saveFavorites(favs);
   }
 }
 
-// Claude API — консьерж
+// ─── Подписки (Feature 4) ─────────────────────────────────────────────────────
+const SUBS_FILE = path.join(DATA_DIR, 'subscriptions.json');
+
+function loadSubs() {
+  try {
+    if (!fs.existsSync(SUBS_FILE)) return {};
+    return JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+  } catch (e) { return {}; }
+}
+
+function saveSubs(data) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(SUBS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {}
+}
+
+function addSub(userId, label, params) {
+  const subs = loadSubs();
+  if (!subs[userId]) subs[userId] = [];
+  subs[userId] = subs[userId].filter(s => s.label !== label);
+  subs[userId].push({ label, params, createdAt: new Date().toISOString() });
+  saveSubs(subs);
+}
+
+function removeSub(userId, label) {
+  const subs = loadSubs();
+  if (subs[userId]) { subs[userId] = subs[userId].filter(s => s.label !== label); saveSubs(subs); }
+}
+
+// ─── Статистика (Feature 5) ───────────────────────────────────────────────────
+const stats = {
+  users: new Set(),
+  queries: [],
+  metros: {},
+  checks: [],
+  resetDaily() { this.users = new Set(); this.queries = []; this.metros = {}; this.checks = []; }
+};
+
+function trackQuery(ctx, queryText, count, params) {
+  stats.users.add(ctx.from.id);
+  stats.queries.push({ name: ctx.from.first_name || 'Пользователь', text: queryText,
+    time: new Date().toLocaleTimeString('ru-RU', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit' }), results: count });
+  if (params && params['metro[]']) {
+    const m = CACHE.metros.find(x => x.id === params['metro[]']);
+    const key = m ? m.name : String(params['metro[]']);
+    stats.metros[key] = (stats.metros[key] || 0) + 1;
+  }
+  if (params && params['middleCheck[to]']) stats.checks.push(params['middleCheck[to]']);
+}
+
+// ─── Claude API ───────────────────────────────────────────────────────────────
 async function parseIntent(userMessage) {
   try {
     const now = new Date();
@@ -41,92 +146,104 @@ async function parseIntent(userMessage) {
     const weekday = weekdays[new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getDay()];
 
     const systemPrompt = 'Ты — опытный консьерж ресторанного гида GdeBar.ru.\n'
-      + 'Твоя задача: понять что человек РЕАЛЬНО хочет и извлечь параметры поиска.\n\n'
-      + 'КОНТЕКСТ:\n'
-      + '- Сервис: рестораны, кафе, бары Москвы и Санкт-Петербурга\n'
-      + '- Сегодня: ' + moscowDate + ', ' + moscowTime + ' по Москве, день недели: ' + weekday + '\n\n'
-      + 'ЛОГИКА (думай как консьерж):\n\n'
-      + '1. ИНТЕРПРЕТИРУЙ НАМЕРЕНИЕ:\n'
-      + '   - "посидеть после работы" -> opened_now=true, options:[bar_desk, cocktails]\n'
-      + '   - "нас двое, атмосферно" -> good_for: романтика\n'
-      + '   - "компания 10 человек" -> banket_for с вместимостью\n'
-      + '   - "на обед что-то лёгкое" -> options:[lunch], price_to:1200\n'
-      + '   - "с детьми" -> options:[kid]\n\n'
-      + '2. БЮДЖЕТ:\n'
-      + '   - "бюджетно"/"недорого" -> price_to:1200\n'
-      + '   - "средний" -> price_to:2500\n'
-      + '   - "без ограничений"/"хорошее место" -> не включай price\n'
-      + '   - "дорогой" -> price_from:3000\n\n'
-      + '3. МЕТРО: бери точно как написал пользователь, даже с ошибкой\n\n'
-      + '4. УВЕРЕННОСТЬ:\n'
-      + '   - 0.9+: четкий запрос\n'
-      + '   - 0.6-0.9: понятно, небольшие неоднозначности\n'
-      + '   - 0.3-0.6: размытый — добавь clarify с одним вопросом\n'
-      + '   - 0-0.3: не про рестораны -> off_topic:true\n\n'
-      + '5. СПЕЦСЛУЧАИ:\n'
-      + '   - Конкретное название -> venue_name\n'
-      + '   - Не про рестораны -> off_topic:true\n'
-      + '   - Питер -> city:"spb"\n\n'
-      + 'ВЕРНИ ТОЛЬКО JSON, только заполненные поля:\n'
-      + '{"metro_name":"...","kitchen":"...","type":"...","price_from":0,"price_to":0,"options":[],"good_for":"...","banket_for":"...","opened_now":true,"city":"spb","venue_name":"...","confidence":0.9,"off_topic":false,"clarify":"..."}';
+      + 'Задача: понять что человек хочет и извлечь параметры поиска.\n\n'
+      + 'КОНТЕКСТ: ' + moscowDate + ', ' + moscowTime + ' МСК, ' + weekday + '\n\n'
+      + 'ЛОГИКА:\n'
+      + '1. "посидеть после работы" -> opened_now=true, options:[bar_desk,cocktails]\n'
+      + '2. "нас двое, атмосферно" -> good_for:романтика\n'
+      + '3. "на обед" -> options:[lunch], price_to:1200\n'
+      + '4. "с детьми" -> options:[kid]\n'
+      + '5. "бюджетно" -> price_to:1200; "средний" -> price_to:2500; "дорогой" -> price_from:3000\n'
+      + '6. МЕТРО: бери точно как написал пользователь\n'
+      + '7. "в 5 минутах от метро" / "рядом с метро" -> metro_distance:500\n'
+      + '8. "где поесть борщ" / "хочу стейк" -> food:["Борщ"] или food:["Стейк"]\n'
+      + '9. "работает в воскресенье" -> schedule_day:7 (1=Пн..7=Вс)\n'
+      + '10. "работает после 22" / "до 23" -> schedule_time:"22:00"\n'
+      + '11. "нас будет 20 человек" / "большая компания" -> capacity_from:20\n'
+      + '12. "со своим алкоголем" -> alco_with_self:1\n'
+      + '13. "есть доставка" -> dostavka:true\n'
+      + '14. "кейтеринг" -> catering:true\n'
+      + '15. "недавно открылось" / "новое заведение" -> newest:true\n'
+      + '16. "из сети Novikov" / "Ginza" -> chain_name:"Novikov Group"\n'
+      + '17. confidence: 0.9+=чёткий, 0.6-0.9=понятно, 0.3-0.6=размытый(+clarify), 0-0.3=off_topic\n\n'
+      + 'ВЕРНИ ТОЛЬКО JSON (только заполненные поля):\n'
+      + '{"metro_name":"...","metro_distance":500,"kitchen":"...","direction":"...","food":["..."],"type":"...","price_from":0,"price_to":0,"options":[],"good_for":"...","banket_for":"...","opened_now":true,"schedule_day":7,"schedule_time":"22:00","capacity_from":0,"capacity_to":0,"alco_with_self":1,"dostavka":true,"catering":true,"newest":true,"chain_name":"...","city":"spb","venue_name":"...","confidence":0.9,"off_topic":false,"clarify":"..."}';
 
-    const resp = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      {
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 500,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMessage }],
-      },
+    const resp = await axios.post('https://api.anthropic.com/v1/messages',
+      { model: 'claude-sonnet-4-20250514', max_tokens: 500, system: systemPrompt, messages: [{ role: 'user', content: userMessage }] },
       { headers: { 'x-api-key': process.env.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' } }
     );
-    const raw = resp.data.content[0].text.trim().replace(/```json|```/g, '').trim();
-    return JSON.parse(raw);
-  } catch (e) {
-    console.error('Ошибка parseIntent:', e.message);
-    return {};
-  }
+    return JSON.parse(resp.data.content[0].text.trim().replace(/```json|```/g, '').trim());
+  } catch (e) { console.error('parseIntent:', e.message); return {}; }
 }
 
-// Параметры запроса
+// ─── Параметры ────────────────────────────────────────────────────────────────
 function buildParams(intent) {
   const params = {};
   if (intent.venue_name) params['term'] = intent.venue_name;
   if (intent.metro_name) {
-    const name = intent.metro_name.toLowerCase();
-    const metro = CACHE.metros.find(m =>
-      m.name.toLowerCase().includes(name) || name.includes(m.name.toLowerCase().split(' ')[0])
-    );
+    const n = intent.metro_name.toLowerCase().trim();
+    const metro = CACHE.metros.find(m => m.name.toLowerCase() === n)
+      || CACHE.metros.find(m => m.name.toLowerCase().startsWith(n))
+      || CACHE.metros.find(m => m.name.toLowerCase().includes(n))
+      || CACHE.metros.find(m => n.includes(m.name.toLowerCase()));
     if (metro) params['metro[]'] = metro.id;
+    else params['_metroNotFound'] = intent.metro_name;
   }
-  if (intent.kitchen) {
-    const k = CACHE.kitchens.find(x => x.name.toLowerCase().includes(intent.kitchen.toLowerCase()));
-    if (k) params['kitchen[]'] = k.id;
-  }
-  if (intent.type) {
-    const t = CACHE.types.find(x => x.name.toLowerCase().includes(intent.type.toLowerCase()));
-    if (t) params['type[]'] = t.id;
-  }
+  if (intent.kitchen) { const k = CACHE.kitchens.find(x => x.name.toLowerCase().includes(intent.kitchen.toLowerCase())); if (k) params['kitchen[]'] = k.id; }
+  if (intent.type) { const t = CACHE.types.find(x => x.name.toLowerCase().includes(intent.type.toLowerCase())); if (t) params['type[]'] = t.id; }
   if (intent.banket_for) {
-    const map = { 'день рождения':1, 'новый год':2, 'корпоратив':3, 'свадьба':4, 'юбилей':4, 'детский':5, 'девичник':6 };
+    const map = { 'день рождения':1,'новый год':2,'корпоратив':3,'свадьба':4,'юбилей':4,'детский':5,'девичник':6 };
     const n = intent.banket_for.toLowerCase();
-    for (const [k, v] of Object.entries(map)) { if (n.includes(k)) { params['banket[good_for][]'] = v; break; } }
+    for (const [k,v] of Object.entries(map)) { if (n.includes(k)) { params['banket[good_for][]'] = v; break; } }
   }
-  if (intent.good_for) {
-    const gf = CACHE.goodFor.find(x => x.name.toLowerCase().includes(intent.good_for.toLowerCase()));
-    if (gf) params['good_for[]'] = gf.id;
+  if (intent.good_for) { const gf = CACHE.goodFor.find(x => x.name.toLowerCase().includes(intent.good_for.toLowerCase())); if (gf) params['good_for[]'] = gf.id; }
+  // Направление кухни
+  if (intent.direction) {
+    const d = CACHE.kitchens.find(x => x.name.toLowerCase().includes(intent.direction.toLowerCase()));
+    if (d) params['direction[]'] = d.id;
+  }
+  // Поиск по блюду
+  if (Array.isArray(intent.food) && intent.food.length) {
+    intent.food.forEach((f, i) => { params['food[' + i + ']'] = f; });
+  }
+  // Расстояние до метро
+  if (intent.metro_distance) params['distance'] = intent.metro_distance;
+  // Расписание
+  if (intent.schedule_day) params['schedule[day]'] = intent.schedule_day;
+  if (intent.schedule_time) params['schedule[time]'] = intent.schedule_time;
+  // Вместимость
+  if (intent.capacity_from) params['capacity[from]'] = intent.capacity_from;
+  if (intent.capacity_to)   params['capacity[to]']   = intent.capacity_to;
+  // Свой алкоголь
+  if (intent.alco_with_self) params['alco_with_self[]'] = intent.alco_with_self;
+  // Доставка и кейтеринг
+  if (intent.dostavka) params['dostavka'] = 'on';
+  if (intent.catering) params['catering'] = 'on';
+  // Новые заведения
+  if (intent.newest) params['newest'] = 1;
+  // Сеть заведений
+  if (intent.chain_name) {
+    const chainMap = {
+      'novikov': 87, 'новиков': 87,
+      'ginza': 88, 'гинза': 88,
+      'евгенич': 172775,
+      'everest': 172070,
+    };
+    const cn = intent.chain_name.toLowerCase();
+    for (const [k, v] of Object.entries(chainMap)) {
+      if (cn.includes(k)) { params['chain'] = v; break; }
+    }
   }
   if (intent.price_from) params['middleCheck[from]'] = intent.price_from;
   if (intent.price_to)   params['middleCheck[to]']   = intent.price_to;
   if (intent.opened_now) params['opened_now'] = 'on';
   if (intent.city === 'spb') params['city'] = 'spb';
-  if (Array.isArray(intent.options)) {
-    for (const opt of intent.options) params[`options[${opt}]`] = 'on';
-  }
+  if (Array.isArray(intent.options)) { for (const opt of intent.options) params['options[' + opt + ']'] = 'on'; }
   return params;
 }
 
-// Форматирование карточки
+// ─── Форматирование ───────────────────────────────────────────────────────────
 function formatBar(bar, index) {
   const stars = bar.rating >= 9 ? '🌟' : bar.rating >= 7 ? '⭐' : '✨';
   const lines = [
@@ -134,18 +251,15 @@ function formatBar(bar, index) {
     bar.rating ? stars + ' *' + bar.rating + '* (' + bar.reviews_count + ' отз.)' : '',
     bar.avg_check ? '💰 ' + bar.avg_check + ' руб.' : '',
     bar.metro ? '🚇 ' + bar.metro + (bar.metro_distance_m ? ' · ' + bar.metro_distance_m + ' м' : '') : '',
-    bar.cuisine?.length ? '🍽 ' + bar.cuisine.slice(0, 3).join(', ') : '',
+    bar.cuisine && bar.cuisine.length ? '🍽 ' + bar.cuisine.slice(0, 3).join(', ') : '',
     bar.description ? '_' + bar.description.trim() + '_' : '',
-    bar.features?.length ? '✨ ' + bar.features.slice(0, 4).join(' · ') : '',
+    bar.features && bar.features.length ? '✨ ' + bar.features.slice(0, 4).join(' · ') : '',
     bar.phone ? '📞 [' + bar.phone + '](tel:' + bar.phone.replace(/[^+\d]/g, '') + ')' : '',
   ].filter(Boolean);
   return lines.join('\n');
 }
 
-function cleanUrl(url) {
-  // Убираем utm-параметры для чистых ссылок на меню/отзывы
-  return url ? url.split('?')[0] : '';
-}
+function cleanUrl(url) { return url ? url.split('?')[0] : ''; }
 
 function barInlineKeyboard(bar) {
   const base = cleanUrl(bar.url);
@@ -154,106 +268,48 @@ function barInlineKeyboard(bar) {
   if (bar.url) row1.push(Markup.button.url('🌐 На сайте', bar.url));
   if (base) row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
   if (base) row2.push(Markup.button.url('💬 Отзывы' + (bar.reviews_count ? ' (' + bar.reviews_count + ')' : ''), base + '/otzyvy'));
+  row2.push(Markup.button.callback('❤️ В избранное', 'fav_' + bar.id + '_' + encodeURIComponent(bar.name.slice(0, 30))));
+  if (bar.cuisine && bar.cuisine.length) row2.push(Markup.button.callback('🔁 Похожие', 'similar_' + bar.id));
   return Markup.inlineKeyboard([row1, row2]);
 }
 
-function hasValidPhoto(url) {
-  return url && url.startsWith('http') && !url.includes('placeholder') && !url.includes('localhost');
-}
+function hasValidPhoto(url) { return url && url.startsWith('http') && !url.includes('placeholder') && !url.includes('localhost'); }
 
-// Статистика
-const stats = { users: new Set(), queries: [], resetDaily() { this.users = new Set(); this.queries = []; } };
-function trackQuery(ctx, queryText, count) {
-  stats.users.add(ctx.from.id);
-  stats.queries.push({
-    name: ctx.from.first_name || 'Пользователь',
-    text: queryText,
-    time: new Date().toLocaleTimeString('ru-RU', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit' }),
-    results: count,
-  });
-}
-
-// Состояние
+// ─── Состояние ────────────────────────────────────────────────────────────────
 const sessions = {};
 const wizards  = {};
+const barCache = {}; // id -> bar object для похожих и избранного
 
-// Сообщения ожидания
-const MSG1 = [
-  '🔍 Сейчас поищем что-нибудь подходящее, уже смотрю варианты...',
-  '🔍 Секунду, просматриваю заведения по вашему запросу...',
-  '🔍 Уже ищу — сейчас найдём что-то хорошее...',
-];
-const MSG2 = [
-  '✨ Нашлось несколько вариантов, формирую для вас...',
-  '✨ Хорошие заведения попались, сейчас покажу...',
-  '✨ Вижу отличные варианты, собираю карточки...',
-];
+// ─── Сообщения ────────────────────────────────────────────────────────────────
+const MSG1 = ['🔍 Сейчас поищем что-нибудь подходящее...', '🔍 Просматриваю заведения по вашему запросу...', '🔍 Уже ищу — сейчас найдём...'];
+const MSG2 = ['✨ Нашлось несколько вариантов, формирую...', '✨ Хорошие заведения попались, сейчас покажу...', '✨ Собираю карточки — ещё секунду...'];
 function rnd(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Wizard — пошаговый подбор
+// ─── Wizard ───────────────────────────────────────────────────────────────────
 async function runWizard(ctx, userId) {
   const w = wizards[userId];
   if (!w) return;
-
   if (w.step === 0) {
-    // Шаг 1: цель
-    await ctx.reply(
-      'Хорошо, давайте подберём вместе! \n\nКуда хотите пойти?',
-      Markup.keyboard([
-        ['🍻 Выпить в баре или пабе'],
-        ['🤫 Спокойно поговорить'],
-        ['🎤 Спеть в караоке'],
-        ['🕺 Потанцевать под DJ'],
-        ['🎸 Послушать живую музыку'],
-        ['👶 Пойти с детьми'],
-        ['🎂 Отметить день рождения'],
-        ['💼 Деловая встреча'],
-        ['🍽 Просто вкусно поесть'],
-        ['❌ Отмена'],
-      ]).resize()
-    );
-
+    await ctx.reply('Давайте подберём вместе!\n\nЧто важнее всего в этот раз?',
+      Markup.keyboard([['🍻 Выпить в баре или пабе'],['🤫 Спокойно поговорить'],['🎤 Спеть в караоке'],['🕺 Потанцевать'],['🎸 Живая музыка'],['👶 Пойти с детьми'],['💼 Деловая встреча'],['🍽 Вкусно поесть'],['🌿 С верандой'],['❌ Отмена']]).resize());
   } else if (w.step === 1) {
-    // Шаг 2: бюджет (зависит от цели)
-    const occasion = w.answers.occasion || '';
-    let q = 'Понял! А какой примерно бюджет на человека?';
-    if (occasion.includes('день рождения')) q = 'Отлично, именины — это всегда приятно 🎉\n\nКакой бюджет на человека планируете?';
-    else if (occasion.includes('Деловая')) q = 'Деловой формат — тогда важно место с атмосферой.\n\nКакой бюджет на человека?';
-    else if (occasion.includes('детьми')) q = 'С детьми — главное чтобы было комфортно 👶\n\nКакой бюджет на человека?';
-    await ctx.reply(q,
-      Markup.keyboard([
-        ['до 1 000 руб.'],
-        ['1 000 – 1 500 руб.'],
-        ['1 500 – 2 000 руб.'],
-        ['2 000 – 3 000 руб.'],
-        ['от 3 000 руб.'],
-        ['Не важно'],
-        ['❌ Отмена'],
-      ]).resize()
-    );
-
+    const occ = w.answers.occasion || '';
+    let q = 'Какой примерно бюджет на человека?';
+    if (occ.includes('детьми')) q = 'С детьми — главное чтоб было комфортно 👶\n\nКакой бюджет на человека?';
+    else if (occ.includes('Деловая')) q = 'Деловой формат — важна атмосфера.\n\nКакой бюджет на человека?';
+    await ctx.reply(q, Markup.keyboard([['до 1 000 руб.'],['1 000 – 1 500 руб.'],['1 500 – 2 000 руб.'],['2 000 – 3 000 руб.'],['от 3 000 руб.'],['Не важно'],['❌ Отмена']]).resize());
   } else if (w.step === 2) {
-    // Шаг 3: район / метро
-    await ctx.reply(
-      'Почти готово! \n\nВ каком районе ищем? Выберите округ или напишите станцию метро:',
-      Markup.keyboard([
-        ['ЦАО', 'ЗАО', 'САО'],
-        ['ЮЗАО', 'ЮАО', 'СВАО'],
-        ['ВАО', 'ЮВАО', 'СЗАО'],
-        ['Не важно'],
-        ['❌ Отмена'],
-      ]).resize()
-    );
-
+    await ctx.reply('Почти готово!\n\nВ каком районе ищем? Выберите округ или напишите метро:',
+      Markup.keyboard([['ЦАО','ЗАО','САО'],['ЮЗАО','ЮАО','СВАО'],['ВАО','ЮВАО','СЗАО'],['Не важно'],['❌ Отмена']]).resize());
   } else {
-    // Все ответы собраны — ищем
     delete wizards[userId];
     const { occasion, budget, location } = w.answers;
-    const parts = [];
-    if (occasion && !occasion.includes('Отмена')) parts.push(occasion.replace(/^[\S]+ /, ''));
-    if (budget && budget !== 'Не важно') parts.push('бюджет ' + budget);
-    if (location && !['Не важно', '❌ Отмена'].includes(location)) parts.push(location);
+    const parts = [
+      occasion && !occasion.includes('Отмена') ? occasion.replace(/^[\S]+ /, '') : '',
+      budget && budget !== 'Не важно' ? 'бюджет ' + budget : '',
+      location && !['Не важно','❌ Отмена'].includes(location) ? location : '',
+    ].filter(Boolean);
     const query = parts.join(', ');
     await ctx.reply('Ищу для вас — ' + query + ' 🔍');
     const intent = await parseIntent(query);
@@ -265,176 +321,229 @@ async function runWizard(ctx, userId) {
   }
 }
 
-// Популярные подборки
-const POPULAR = [
-  '🍷 Романтический ужин',
-  '🎂 День рождения',
-  '💼 Бизнес-встреча',
-  '🍻 Бар с живой музыкой',
-  '🌿 С верандой на свежем воздухе',
-  '👨‍👩‍👧 С детьми',
-  '🎤 Кальян и DJ',
-  '🌅 Панорамный вид',
-  '🐣 Куда выйти в апреле',
-  '🎯 Что-то необычное',
-];
+// ─── Популярные подборки ──────────────────────────────────────────────────────
+const POPULAR = ['🍷 Романтический ужин','🍻 Бар с живой музыкой','🌿 С верандой','👶 С детьми','🎤 Кальян','🌅 Панорамный вид','🎸 Живая музыка','🍣 Японская кухня','🥩 Стейк-хаус','☕ Кофейня'];
+
 function mainKeyboard() {
-  return Markup.keyboard([...POPULAR.map(p => [p]), ['🤔 Задай мне 5 вопросов'], ['🔄 Новый поиск']]).resize();
+  return Markup.keyboard([...POPULAR.map(p => [p]), ['🟢 Открыто сейчас','🤔 Задай мне 5 вопросов'], ['📋 Мои подписки','❤️ Избранное'], ['🔄 Новый поиск']]).resize();
 }
 
-// Команды
-bot.start(async ctx => {
-  await ctx.reply(
-    'Привет! 👋\n\n' +
-    'Меня зовут Алекс, я помогаю подбирать рестораны, кафе и бары в Москве и Санкт-Петербурге.\n\n' +
-    'На сайте GdeBar.ru собраны тысячи заведений — с меню, фото, отзывами и возможностью забронировать столик онлайн. ' +
-    'Я помогу быстро найти то, что подойдёт именно вам — по настроению, бюджету и компании.\n\n' +
-    'Для начала скажите: вы ищете в каком городе?',
-    Markup.keyboard([['🏙 Москва', '🌊 Санкт-Петербург']]).resize()
-  );
-});
-bot.help(ctx => ctx.reply(
-  'Напишите что ищете в свободной форме или выберите подборку.\nМожно указать: метро, кухню, бюджет, особенности.'
-));
-
-// Показ результатов
+// ─── Показ результатов ────────────────────────────────────────────────────────
 async function showResults(ctx, userId) {
   const session = sessions[userId];
   if (!session) return;
   const isFirst = session.page === 1;
 
-  if (isFirst) {
-    await ctx.reply(rnd(MSG1));
-    await ctx.sendChatAction('typing');
+  if (isFirst) { await ctx.reply(rnd(MSG1)); await ctx.sendChatAction('typing'); }
+
+  let response;
+  try {
+    const [resp] = await Promise.all([
+      apiGet('/search', { ...session.params, page: session.page, per_page: 6 }),
+      isFirst ? sleep(3000) : Promise.resolve(),
+    ]);
+    response = resp;
+  } catch(e) {
+    const timeoutMsgs = [
+      'Упс... похоже наш сервер решил немного вздремнуть 😴 Попробуйте через минуту!',
+      'Сервер завис — видимо тоже ищет где поужинать 🍽 Повторите запрос чуть позже.',
+      'Что-то у нас сервер задумался... Он не злой, просто медленный 🐢 Попробуйте ещё раз!',
+      'База данных взяла кофе-брейк ☕ Обычно это ненадолго — попробуйте через 30 секунд.',
+    ];
+    await ctx.reply(timeoutMsgs[Math.floor(Math.random() * timeoutMsgs.length)],
+      Markup.keyboard([['🔄 Попробовать снова'], ['🔄 Новый поиск']]).resize());
+    return;
   }
 
-  const [response] = await Promise.all([
-    api.get('/search', { params: { ...session.params, page: session.page, per_page: 6 } }),
-    isFirst ? sleep(3000) : Promise.resolve(),
-  ]);
-
-  const allBars  = response.data.data || [];
-  const meta     = response.data.meta || {};
-  const total    = meta.total || 0;
+  const allBars = response.data.data || [];
+  const meta    = response.data.meta || {};
+  const total   = meta.total || 0;
   const lastPage = meta.last_page || 1;
 
   if (allBars.length === 0) {
-    // Пробуем без самого ограничивающего параметра
-    const relaxedParams = { ...session.params };
-    let relaxedMsg = '';
-    if (relaxedParams['middleCheck[to]']) {
-      delete relaxedParams['middleCheck[to]'];
-      delete relaxedParams['middleCheck[from]'];
-      relaxedMsg = 'чуть расширю бюджет';
-    } else if (relaxedParams['metro[]']) {
-      delete relaxedParams['metro[]'];
-      relaxedMsg = 'расширю до всего района';
-    } else if (relaxedParams['kitchen[]']) {
-      delete relaxedParams['kitchen[]'];
-      relaxedMsg = 'уберу фильтр по кухне';
-    }
-
-    if (relaxedMsg) {
-      const retry = await api.get('/search', { params: { ...relaxedParams, page: 1, per_page: 6 } });
+    const relaxed = { ...session.params };
+    let msg = '';
+    if (relaxed['middleCheck[to]']) { delete relaxed['middleCheck[to]']; delete relaxed['middleCheck[from]']; msg = 'расширяю бюджет'; }
+    else if (relaxed['metro[]']) { delete relaxed['metro[]']; msg = 'расширяю до всего района'; }
+    else if (relaxed['kitchen[]']) { delete relaxed['kitchen[]']; msg = 'убираю фильтр по кухне'; }
+    if (msg) {
+      const retry = await apiGet('/search', { ...relaxed, page: 1, per_page: 6 });
       const retryBars = retry.data.data || [];
       if (retryBars.length > 0) {
-        await ctx.reply('По точному запросу не нашлось — ' + relaxedMsg + ' и смотрю шире 🔍');
-        session.params = relaxedParams;
-        // продолжаем с найденными результатами
-        const withPhone = retryBars.filter(b => b.phone);
-        const withoutPhone = retryBars.filter(b => !b.phone);
-        const sorted2 = [...withPhone, ...withoutPhone].slice(0, 3);
-        if (isFirst) { trackQuery(ctx, session.lastQuery || '', sorted2.length); await ctx.reply(rnd(MSG2)); await ctx.sendChatAction('typing'); await sleep(2000); }
-        const offset2 = 0;
+        await ctx.reply('По точному запросу не нашлось — ' + msg + ' 🔍');
+        session.params = relaxed;
+        const sorted2 = [...retryBars.filter(b=>b.phone), ...retryBars.filter(b=>!b.phone)].slice(0, 3);
+        if (isFirst) { trackQuery(ctx, session.lastQuery||'', sorted2.length, relaxed); await ctx.reply(rnd(MSG2)); await ctx.sendChatAction('typing'); await sleep(2000); }
         for (let i = 0; i < sorted2.length; i++) {
-          const bar = sorted2[i]; const text2 = formatBar(bar, i + 1);
-          const kb2 = barInlineKeyboard(bar);
-          if (hasValidPhoto(bar.photo_url)) { try { await ctx.replyWithPhoto(bar.photo_url, { caption: text2, parse_mode: 'Markdown', ...kb2 }); continue; } catch(e) {} }
-          await ctx.replyWithMarkdown(text2, { disable_web_page_preview: true, ...kb2 });
+          const bar = sorted2[i]; barCache[bar.id] = bar;
+          const text = formatBar(bar, i+1); const kb = barInlineKeyboard(bar);
+          if (hasValidPhoto(bar.photo_url)) { try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch(e) {} }
+          await ctx.replyWithMarkdown(text, { disable_web_page_preview: true, ...kb });
         }
-        await ctx.reply('Нашёл ' + retry.data.meta?.total + ' заведений с чуть расширенными параметрами — показываю лучшие.',
-          Markup.keyboard([['📄 Показать ещё'], ['🔄 Новый поиск']]).resize());
+        await ctx.reply('Нашлось ' + (retry.data.meta?.total||0) + ' заведений с расширенными параметрами.',
+          Markup.keyboard([['📄 Показать ещё'],['💸 Подешевле','💎 Подороже'],['🔄 Новый поиск']]).resize());
         return;
       }
     }
-
-    return ctx.reply(
-      'Хм, по таким параметрам пока ничего не нашлось 🤔\n\nПопробуйте что-то изменить — например, другой район или бюджет. Или давайте подберём вместе:',
-      Markup.keyboard([['🤔 Задай мне 5 вопросов'], ['🔄 Новый поиск']]).resize()
-    );
+    return ctx.reply('Хм, по таким параметрам пока ничего 🤔\n\nПопробуйте другой район или бюджет:',
+      Markup.keyboard([['🤔 Задай мне 5 вопросов'],['🔄 Новый поиск']]).resize());
   }
 
-  const withPhone    = allBars.filter(b => b.phone);
-  const withoutPhone = allBars.filter(b => !b.phone);
-  const sorted = [...withPhone, ...withoutPhone].slice(0, 3);
-
-  if (isFirst) {
-    trackQuery(ctx, session.lastQuery || '', sorted.length);
-    await ctx.reply(rnd(MSG2));
-    await ctx.sendChatAction('typing');
-    await sleep(2500);
-  }
+  const sorted = [...allBars.filter(b=>b.phone), ...allBars.filter(b=>!b.phone)].slice(0, 3);
+  if (isFirst) { trackQuery(ctx, session.lastQuery||'', sorted.length, session.params); await ctx.reply(rnd(MSG2)); await ctx.sendChatAction('typing'); await sleep(2500); }
 
   const offset = (session.page - 1) * 3;
   for (let i = 0; i < sorted.length; i++) {
-    const bar  = sorted[i];
-    const text = formatBar(bar, offset + i + 1);
-    const kb = barInlineKeyboard(bar);
-    if (hasValidPhoto(bar.photo_url)) {
-      try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch (e) {}
-    }
+    const bar = sorted[i]; barCache[bar.id] = bar;
+    const text = formatBar(bar, offset+i+1); const kb = barInlineKeyboard(bar);
+    if (hasValidPhoto(bar.photo_url)) { try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch(e) {} }
     await ctx.replyWithMarkdown(text, { disable_web_page_preview: true, ...kb });
   }
 
   const hasMore = session.page < lastPage;
-  await ctx.reply(
-    'Вот что подобрал — ' + total + ' заведений по вашему запросу, показываю лучшие.',
-    hasMore
-      ? Markup.keyboard([['📄 Показать ещё'], ['🔄 Новый поиск']]).resize()
-      : Markup.keyboard([['🔄 Новый поиск']]).resize()
+  const outroText = total > 10 ? 'Нашлось ' + total + ' заведений — вот топ по рейтингу 👆' : 'Вот что подобрал по вашему запросу 👆';
+
+  await ctx.reply(outroText,
+    Markup.keyboard([
+      hasMore ? ['📄 Показать ещё'] : [],
+      ['💸 Подешевле', '💎 Подороже'],
+      ['📍 Ближе к центру'],
+      ['🔄 Новый поиск'],
+    ].filter(r => r.length > 0)).resize()
   );
 
-  // Отложенное сообщение через 10 секунд
+  // Отложенное сообщение через 10 сек
   if (isFirst) {
     setTimeout(async () => {
       try {
-        await ctx.reply(
-          'Кстати, советую не останавливаться только на фото 🙂\n\n' +
-          'На сайте каждого заведения вы найдёте полное меню, живые отзывы, актуальные фото и форму бронирования. ' +
-          'Если уже присмотрели что-то — звоните напрямую по номеру телефона или бронируйте столик онлайн прямо там.\n\n' +
-          'Если ни один вариант не подошёл — напишите, что не так, подберём другое 👇'
-        );
-      } catch (e) { /* пользователь мог уйти */ }
+        await ctx.reply('Советую перейти на сайт — там полное меню, живые отзывы и форма бронирования.\nЕсли определились — звоните напрямую или бронируйте онлайн 👆');
+      } catch(e) {}
     }, 10000);
   }
 }
 
-// Callback — кнопка «Отзывы»
-bot.action(/^reviews_(.+)$/, async ctx => {
-  await ctx.answerCbQuery();
-  const barId = ctx.match[1];
-  try {
-    const resp = await api.get('/search', { params: { term: '', page: 1, per_page: 50 } });
-    const bars = resp.data.data || [];
-    const bar = bars.find(b => String(b.id) === barId);
-    if (bar && bar.reviews_count) {
-      const label = bar.rating >= 9 ? 'Идеально' : bar.rating >= 7 ? 'Отлично' : 'Хорошо';
-      await ctx.reply(
-        '💬 *' + bar.name + '*\n\n' +
-        '⭐ Рейтинг: *' + bar.rating + '*  (' + label + ')\n' +
-        '📝 Всего отзывов: *' + bar.reviews_count + '*\n\n' +
-        'Читайте все отзывы на сайте 👇',
-        { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.url('Читать отзывы на GdeBar.ru', bar.url)]]) }
-      );
-    } else {
-      await ctx.reply('Отзывы пока недоступны для этого заведения.');
-    }
-  } catch (e) {
-    await ctx.reply('Не удалось загрузить отзывы. Попробуйте открыть страницу заведения на сайте.');
+// ─── Команды ──────────────────────────────────────────────────────────────────
+bot.start(async ctx => {
+  const adminId = process.env.ADMIN_CHAT_ID;
+  if (adminId) {
+    const u = ctx.from;
+    bot.telegram.sendMessage(adminId,
+      '🆕 *Новый пользователь*\n👤 ' + [u.first_name, u.last_name].filter(Boolean).join(' ') +
+      '\n🔗 ' + (u.username ? '@'+u.username : 'нет') + '\n🆔 `' + u.id + '`\n🕐 ' +
+      new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }),
+      { parse_mode: 'Markdown' }).catch(()=>{});
   }
+  await ctx.reply(
+    'Привет! 👋\n\n' +
+    'Я помогаю находить рестораны, кафе и бары в Москве и Санкт-Петербурге.\n\n' +
+    'Умею подбирать по:\n' +
+    '• Станции метро или округу\n' +
+    '• Типу кухни (грузинская, японская, итальянская...)\n' +
+    '• Бюджету на человека\n' +
+    '• Особенностям (кальян, веранда, живая музыка, дети, DJ...)\n\n' +
+    'С какого города начнём?',
+    Markup.keyboard([['🏙 Москва', '🌊 Санкт-Петербург']]).resize()
+  );
 });
 
-// Основной обработчик
+bot.help(ctx => ctx.reply('Напишите что ищете или выберите подборку.\nМожно указать: метро, кухню, бюджет, особенности.'));
+
+// /favorites
+bot.command('favorites', async ctx => {
+  const favs = getFavorites(ctx.from.id);
+  if (!favs.length) return ctx.reply('У вас пока нет сохранённых заведений.\n\nНажимайте ❤️ под карточками — они появятся здесь.');
+  let text = '❤️ *Ваше избранное:*\n\n';
+  favs.forEach((b, i) => {
+    text += (i+1) + '. *' + b.name + '*\n';
+    if (b.metro) text += '🚇 ' + b.metro + '\n';
+    if (b.avg_check) text += '💰 ' + b.avg_check + ' руб.\n';
+    if (b.url) text += '[Открыть на сайте](' + b.url + ')\n';
+    text += '\n';
+  });
+  await ctx.replyWithMarkdown(text, { disable_web_page_preview: true });
+});
+
+// /subscribe
+bot.command('subscribe', async ctx => {
+  const subs = loadSubs();
+  const userSubs = subs[ctx.from.id] || [];
+  if (!userSubs.length) {
+    return ctx.reply('У вас нет активных подписок.\n\nПосле поиска нажмите «📬 Подписаться на новинки» — будете получать новые заведения раз в неделю.');
+  }
+  const text = '📬 *Ваши подписки:*\n\n' + userSubs.map((s,i) => (i+1) + '. ' + s.label).join('\n');
+  await ctx.replyWithMarkdown(text, Markup.inlineKeyboard(
+    userSubs.map(s => [Markup.button.callback('❌ Отписаться: ' + s.label.slice(0,20), 'unsub_' + encodeURIComponent(s.label))])
+  ));
+});
+
+// /report
+bot.command('report', async ctx => {
+  const adminId = process.env.ADMIN_CHAT_ID;
+  if (String(ctx.from.id) !== String(adminId)) return ctx.reply('Нет доступа.');
+  const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' });
+  if (stats.queries.length === 0) return ctx.reply('За сегодня (' + date + ') запросов пока не было.');
+
+  const topMetros = Object.entries(stats.metros).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>k+': '+v).join(', ') || 'нет данных';
+  const avgCheck = stats.checks.length ? Math.round(stats.checks.reduce((a,b)=>a+b,0)/stats.checks.length) : 0;
+  const queryCount = {};
+  stats.queries.forEach(q => { const k = q.text.toLowerCase().slice(0,30); queryCount[k] = (queryCount[k]||0)+1; });
+  const topQueries = Object.entries(queryCount).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>v>1?k+' (x'+v+')':k).join('\n') || 'нет';
+
+  const list = stats.queries.map((q,i)=>(i+1)+'. ['+q.time+'] '+q.name+': '+q.text+' - '+q.results+' рез.').join('\n');
+  const report = 'Отчет за ' + date + '\n\nПользователей: ' + stats.users.size + '\nЗапросов: ' + stats.queries.length + '\n\nТоп метро: ' + topMetros + '\nСредний запрашиваемый чек: ' + (avgCheck||'—') + ' руб.\n\nТоп запросы:\n' + topQueries + '\n\nВсе запросы:\n' + list;
+  await ctx.reply(report.length > 4000 ? report.substring(0, 3900) + '\n...' : report);
+});
+
+// ─── Callback кнопки ──────────────────────────────────────────────────────────
+
+// Избранное — добавить
+bot.action(/^fav_(\d+)_(.+)$/, async ctx => {
+  await ctx.answerCbQuery();
+  const barId = parseInt(ctx.match[1]);
+  const bar = barCache[barId];
+  if (!bar) return ctx.answerCbQuery('Не удалось найти заведение');
+  const added = addFavorite(ctx.from.id, bar);
+  await ctx.reply(added ? '❤️ Добавлено в избранное: *' + bar.name + '*\n\nСмотреть: /favorites' : 'Уже есть в избранном.', { parse_mode: 'Markdown' });
+});
+
+// Похожие заведения
+bot.action(/^similar_(\d+)$/, async ctx => {
+  await ctx.answerCbQuery();
+  const barId = parseInt(ctx.match[1]);
+  const bar = barCache[barId];
+  if (!bar) return ctx.reply('Не удалось найти данные о заведении.');
+  const params = {};
+  if (bar.cuisine && bar.cuisine.length) {
+    const k = CACHE.kitchens.find(x => x.name === bar.cuisine[0]);
+    if (k) params['kitchen[]'] = k.id;
+  }
+  if (bar.metro) {
+    const m = CACHE.metros.find(x => x.name === bar.metro);
+    if (m) params['metro[]'] = m.id;
+  }
+  await ctx.reply('Ищу похожие заведения...');
+  try {
+    const resp = await apiGet('/search', { ...params, page: 1, per_page: 6 });
+    const bars = (resp.data.data || []).filter(b => b.id !== barId).slice(0, 3);
+    if (!bars.length) return ctx.reply('Похожих заведений рядом не нашлось.');
+    for (let i = 0; i < bars.length; i++) {
+      const b = bars[i]; barCache[b.id] = b;
+      const text = formatBar(b, i+1); const kb = barInlineKeyboard(b);
+      if (hasValidPhoto(b.photo_url)) { try { await ctx.replyWithPhoto(b.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch(e) {} }
+      await ctx.replyWithMarkdown(text, { disable_web_page_preview: true, ...kb });
+    }
+  } catch(e) { ctx.reply('Ошибка при поиске похожих.'); }
+});
+
+// Отписка
+bot.action(/^unsub_(.+)$/, async ctx => {
+  await ctx.answerCbQuery();
+  const label = decodeURIComponent(ctx.match[1]);
+  removeSub(ctx.from.id, label);
+  await ctx.reply('Отписались от: ' + label);
+});
+
+// ─── Основной обработчик ──────────────────────────────────────────────────────
 bot.on('text', async ctx => {
   const userId = ctx.from.id;
   const text   = ctx.message.text;
@@ -443,22 +552,58 @@ bot.on('text', async ctx => {
   if (text === '🏙 Москва' || text === '🌊 Санкт-Петербург') {
     const city = text === '🌊 Санкт-Петербург' ? 'spb' : 'msk';
     sessions[userId] = { params: city === 'spb' ? { city: 'spb' } : {}, page: 1, lastQuery: '', city };
-    const cityName = city === 'spb' ? 'Петербурге' : 'Москве';
-    await ctx.reply(
-      'Отлично, ищем в ' + cityName + '! 🗺\n\n' +
-      'Куда бы вы хотели пойти? Можете написать своими словами или выбрать из популярного:\n\n' +
-      '• Романтический ужин на двоих\n' +
-      '• Бар с живой музыкой после работы\n' +
-      '• Ресторан для дня рождения компанией\n' +
-      '• Кафе с детьми на выходных\n' +
-      '• Деловой обед или бизнес-встреча\n' +
-      '• Место с верандой и свежим воздухом',
-      mainKeyboard()
-    );
+    await ctx.reply('Отлично, ищем в ' + (city === 'spb' ? 'Петербурге' : 'Москве') + '! 🗺\n\nКуда хотите пойти? Можете написать своими словами или выбрать из популярного:\n\n• Романтический ужин на двоих\n• Бар с живой музыкой после работы\n• Кафе с детьми\n• Деловой обед\n• Место с верандой', mainKeyboard());
     return;
   }
 
-  // Ответ на уточняющий вопрос
+  // Открыто сейчас (Feature 2)
+  if (text === '🟢 Открыто сейчас') {
+    const base = sessions[userId]?.params || {};
+    sessions[userId] = { params: { ...base, opened_now: 'on' }, page: 1, lastQuery: 'открыто сейчас' };
+    return await showResults(ctx, userId);
+  }
+
+  // Избранное
+  if (text === '❤️ Избранное') {
+    return ctx.reply('Смотреть избранное: /favorites');
+  }
+
+  // Подписки
+  if (text === '📋 Мои подписки') {
+    return ctx.reply('Смотреть подписки: /subscribe');
+  }
+
+  // Уточнение после результатов (Feature 3)
+  if (text === '💸 Подешевле' && sessions[userId]) {
+    const p = { ...sessions[userId].params };
+    const curMax = p['middleCheck[to]'] || 3000;
+    p['middleCheck[to]'] = Math.round(curMax * 0.7);
+    delete p['middleCheck[from]'];
+    sessions[userId] = { ...sessions[userId], params: p, page: 1 };
+    await ctx.reply('Ищу подешевле — до ' + p['middleCheck[to]'] + ' руб. 🔍');
+    return await showResults(ctx, userId);
+  }
+
+  if (text === '💎 Подороже' && sessions[userId]) {
+    const p = { ...sessions[userId].params };
+    const curMax = p['middleCheck[to]'] || 2000;
+    p['middleCheck[from]'] = curMax;
+    delete p['middleCheck[to]'];
+    sessions[userId] = { ...sessions[userId], params: p, page: 1 };
+    await ctx.reply('Ищу подороже — от ' + p['middleCheck[from]'] + ' руб. 🔍');
+    return await showResults(ctx, userId);
+  }
+
+  if (text === '📍 Ближе к центру' && sessions[userId]) {
+    const p = { ...sessions[userId].params };
+    delete p['metro[]'];
+    p['location[okrug][]'] = 11; // ЦАО
+    sessions[userId] = { ...sessions[userId], params: p, page: 1 };
+    await ctx.reply('Ищу в центре (ЦАО) 🗺');
+    return await showResults(ctx, userId);
+  }
+
+  // Ответ на clarify
   if (sessions[userId]?.pendingClarify && !wizards[userId] && text !== '🔄 Новый поиск' && text !== '❌ Отмена') {
     const combined = sessions[userId].lastQuery + '. ' + text;
     delete sessions[userId].pendingClarify;
@@ -467,7 +612,7 @@ bot.on('text', async ctx => {
       const intent = await parseIntent(combined);
       sessions[userId] = { params: buildParams(intent), page: 1, lastQuery: combined };
       return await showResults(ctx, userId);
-    } catch (e) { return ctx.reply('Что-то пошло не так. Попробуйте ещё раз.'); }
+    } catch(e) { return ctx.reply('Что-то пошло не так. Попробуйте ещё раз.'); }
   }
 
   // Отмена
@@ -476,24 +621,28 @@ bot.on('text', async ctx => {
     return ctx.reply('Хорошо, отменили. Что ищете?', mainKeyboard());
   }
 
-  // Wizard — сбор ответов
+  // Wizard
   if (wizards[userId]) {
-    const stepKeys = ['occasion', 'budget', 'location'];
+    const stepKeys = ['occasion','budget','location'];
     wizards[userId].answers[stepKeys[wizards[userId].step]] = text;
     wizards[userId].step++;
     return await runWizard(ctx, userId);
   }
 
-  // Запуск wizard
   if (text === '🤔 Задай мне 5 вопросов') {
     wizards[userId] = { step: 0, answers: {} };
     return await runWizard(ctx, userId);
   }
 
-  // Популярные кнопки — сразу в wizard со step 1 (бюджет)
+  // Популярные → сразу wizard с шага 1
   if (POPULAR.includes(text)) {
     wizards[userId] = { step: 1, answers: { occasion: text } };
     return await runWizard(ctx, userId);
+  }
+
+  // Повтор после таймаута
+  if (text === '🔄 Попробовать снова' && sessions[userId]) {
+    return await showResults(ctx, userId);
   }
 
   // Пагинация
@@ -501,6 +650,7 @@ bot.on('text', async ctx => {
     sessions[userId].page++;
     return await showResults(ctx, userId);
   }
+
   if (text === '🔄 Новый поиск') {
     delete sessions[userId];
     return ctx.reply('Хорошо, начнём заново. Что ищете?', mainKeyboard());
@@ -513,50 +663,72 @@ bot.on('text', async ctx => {
     console.log('Intent:', JSON.stringify(intent));
 
     if (intent.off_topic) {
-      return ctx.reply(
-        'Я специализируюсь только на поиске ресторанов, кафе и баров в Москве и Питере.\n\nНапишите что-нибудь вроде «бар с живой музыкой» или выберите подборку 👇',
-        mainKeyboard()
-      );
+      return ctx.reply('Я специализируюсь только на поиске ресторанов, кафе и баров.\n\nНапишите что-нибудь вроде «бар с живой музыкой» или выберите подборку 👇', mainKeyboard());
     }
 
     if (intent.clarify && (intent.confidence || 1) < 0.7) {
       sessions[userId] = { params: {}, page: 1, lastQuery: text, pendingClarify: true };
-      return ctx.reply('🤔 ' + intent.clarify, Markup.keyboard([['❌ Отмена'], ['🔄 Новый поиск']]).resize());
+      return ctx.reply('🤔 ' + intent.clarify, Markup.keyboard([['❌ Отмена'],['🔄 Новый поиск']]).resize());
     }
 
     if ((intent.confidence || 1) < 0.4) {
-      return ctx.reply(
-        'Не совсем понял запрос. Попробуйте переформулировать — например:\n\n• «Ресторан у метро Тверская до 2000 руб»\n• «Бар с кальяном и живой музыкой»\n• «Куда пойти с детьми»\n\nИли нажмите «Задай мне 5 вопросов» 👇',
-        Markup.keyboard([['🤔 Задай мне 5 вопросов'], ['🔄 Новый поиск']]).resize()
-      );
+      return ctx.reply('Не совсем понял запрос.\n\nПопробуйте: «Ресторан у метро Тверская до 2000 руб» или нажмите «Задай мне 5 вопросов» 👇',
+        Markup.keyboard([['🤔 Задай мне 5 вопросов'],['🔄 Новый поиск']]).resize());
     }
 
     const params = buildParams(intent);
     console.log('Params:', JSON.stringify(params));
+
+    if (params['_metroNotFound']) {
+      const nf = params['_metroNotFound']; delete params['_metroNotFound'];
+      await ctx.reply('🚇 Станцию «' + nf + '» не нашёл в базе.\n\nПопробуйте полное название или укажите округ.');
+      return;
+    }
+
     sessions[userId] = { params, page: 1, lastQuery: text };
     await showResults(ctx, userId);
-  } catch (e) {
+  } catch(e) {
     console.error('Ошибка:', e.message);
     ctx.reply('Что-то пошло не так. Попробуйте переформулировать запрос.');
   }
 });
 
-// Ежедневный отчёт 21:00 МСК
+// ─── Ежедневный отчёт 21:00 МСК ──────────────────────────────────────────────
 cron.schedule('0 21 * * *', async () => {
   const adminId = process.env.ADMIN_CHAT_ID;
-  if (!adminId) return;
+  if (!adminId || !stats.queries.length) { stats.resetDaily(); return; }
   const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' });
-  if (stats.queries.length === 0) {
-    await bot.telegram.sendMessage(adminId, '📊 *Отчёт за ' + date + '*\n\nЗапросов не было.', { parse_mode: 'Markdown' });
-    stats.resetDaily(); return;
-  }
-  const list = stats.queries.map((q, i) => (i+1) + '. [' + q.time + '] ' + q.name + ': _' + q.text + '_ → ' + q.results + ' рез.').join('\n');
-  const report = '📊 *Отчёт за ' + date + '*\n\n👥 Пользователей: *' + stats.users.size + '*\n🔍 Запросов: *' + stats.queries.length + '*\n\n*Запросы:*\n' + list + '\n\n_Переходы — Яндекс.Метрика, utm\\_campaign=tg\\_bot\\_ai_';
-  await bot.telegram.sendMessage(adminId, report.length > 4000 ? report.substring(0, 3900) + '\n...' : report, { parse_mode: 'Markdown' });
+  const topMetros = Object.entries(stats.metros).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>k+': '+v).join(', ')||'—';
+  const avgCheck = stats.checks.length ? Math.round(stats.checks.reduce((a,b)=>a+b,0)/stats.checks.length) : 0;
+  const list = stats.queries.map((q,i)=>(i+1)+'. ['+q.time+'] '+q.name+': '+q.text+' - '+q.results+' рез.').join('\n');
+  const report = 'Отчет за '+date+'\n\nПользователей: '+stats.users.size+'\nЗапросов: '+stats.queries.length+'\nТоп метро: '+topMetros+'\nСредний чек: '+(avgCheck||'—')+' руб.\n\nЗапросы:\n'+list;
+  await bot.telegram.sendMessage(adminId, report.length>4000?report.substring(0,3900)+'\n...':report).catch(()=>{});
   stats.resetDaily();
 }, { timezone: 'Europe/Moscow' });
 
-// Старт
+// ─── Еженедельная рассылка подписок (вс 10:00) ───────────────────────────────
+cron.schedule('0 10 * * 0', async () => {
+  const subs = loadSubs();
+  for (const [userId, userSubs] of Object.entries(subs)) {
+    for (const sub of userSubs) {
+      try {
+        const resp = await apiGet('/search', { ...sub.params, newest: 1, page: 1, per_page: 3 });
+        const bars = resp.data.data || [];
+        if (!bars.length) continue;
+        await bot.telegram.sendMessage(userId, '📬 Еженедельная подборка: *' + sub.label + '*', { parse_mode: 'Markdown' });
+        for (const bar of bars) {
+          barCache[bar.id] = bar;
+          const text = formatBar(bar, bars.indexOf(bar)+1);
+          const kb = barInlineKeyboard(bar);
+          if (hasValidPhoto(bar.photo_url)) { try { await bot.telegram.sendPhoto(userId, bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch(e) {} }
+          await bot.telegram.sendMessage(userId, text, { parse_mode: 'Markdown', disable_web_page_preview: true, ...kb });
+        }
+      } catch(e) { console.error('Ошибка рассылки:', e.message); }
+    }
+  }
+}, { timezone: 'Europe/Moscow' });
+
+// ─── Старт ────────────────────────────────────────────────────────────────────
 loadCache().then(() => { bot.launch(); console.log('GdeBar бот запущен'); });
 process.once('SIGINT',  () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
