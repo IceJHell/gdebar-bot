@@ -319,40 +319,65 @@ async function runWizard(ctx, userId) {
     else if (occ.includes('Деловая')) q = 'Деловой формат — важна атмосфера.\n\nКакой бюджет на человека?';
     await ctx.reply(q, Markup.keyboard([['до 1 000 руб.'],['1 000 – 1 500 руб.'],['1 500 – 2 000 руб.'],['2 000 – 3 000 руб.'],['от 3 000 руб.'],['Не важно'],['❌ Отмена']]).resize());
   } else if (w.step === 2) {
+    // Если локация уже задана — пропускаем
+    if (w.skipLocation) { w.step = 3; return await runWizard(ctx, userId); }
     await ctx.reply('Почти готово!\n\nВ каком районе ищем? Выберите округ или напишите метро:',
       Markup.keyboard([['ЦАО','ЗАО','САО'],['ЮЗАО','ЮАО','СВАО'],['ВАО','ЮВАО','СЗАО'],['Не важно'],['❌ Отмена']]).resize());
   } else {
     delete wizards[userId];
     const { occasion, budget, location } = w.answers;
-    const parts = [
-      occasion && !occasion.includes('Отмена') ? occasion.replace(/^[\S]+ /, '') : '',
-      budget && budget !== 'Не важно' ? 'бюджет ' + budget : '',
-      location && !['Не важно','❌ Отмена'].includes(location) ? location : '',
-    ].filter(Boolean);
-    const query = parts.join(', ');
-    await ctx.reply('Ищу для вас — ' + query + ' 🔍');
-    const intent = await parseIntent(query);
     const okrugMap = { 'ЦАО':11,'ЗАО':38,'САО':31,'ЮЗАО':3,'ЮАО':34,'СВАО':8,'ВАО':77,'ЮВАО':82,'СЗАО':28 };
-    const params = buildParams(intent);
-    if (okrugMap[location]) params['location[okrug][]'] = okrugMap[location];
+
+    // Строим параметры: preParams (из кнопки) + бюджет + локация
+    const params = Object.assign({}, w.preParams || {});
+
+    // Округ
+    if (location && okrugMap[location]) params['location[okrug][]'] = okrugMap[location];
+    // Метро (если написал текстом)
+    if (location && !okrugMap[location] && !['Не важно','❌ Отмена'].includes(location)) {
+      const n = location.toLowerCase().trim();
+      const metro = CACHE.metros.find(m => m.name.toLowerCase() === n)
+        || CACHE.metros.find(m => m.name.toLowerCase().startsWith(n))
+        || CACHE.metros.find(m => m.name.toLowerCase().includes(n));
+      if (metro) params['metro[]'] = metro.id;
+    }
+
+    // Бюджет
+    const budgetMap = {
+      'до 1 000 руб.': { to: 1000 },
+      '1 000 – 1 500 руб.': { from: 1000, to: 1500 },
+      '1 500 – 2 000 руб.': { from: 1500, to: 2000 },
+      '2 000 – 3 000 руб.': { from: 2000, to: 3000 },
+      'от 3 000 руб.': { from: 3000 },
+    };
+    if (budget && budgetMap[budget]) {
+      if (budgetMap[budget].from) params['middleCheck[from]'] = budgetMap[budget].from;
+      if (budgetMap[budget].to)   params['middleCheck[to]']   = budgetMap[budget].to;
+    }
+
+    const query = [occasion, budget, location].filter(x => x && !['Не важно','❌ Отмена'].includes(x)).join(', ');
+    console.log('Wizard params:', JSON.stringify(params));
     sessions[userId] = { params, page: 1, lastQuery: query };
+    await ctx.reply('Ищу для вас — ' + query + ' 🔍');
     await showResults(ctx, userId);
   }
 }
 
 // ─── Популярные подборки ──────────────────────────────────────────────────────
-const POPULAR = [
-  '👫 Пойти с друзьями',
-  '🚶 Погулять в центре',
-  '🍷 Романтический ужин',
-  '👶 С детьми',
-  '💼 Деловая встреча',
-  '🍻 Выпить после работы',
-  '🎂 Отметить праздник',
-  '🌿 На свежем воздухе',
-  '🎸 Живая музыка',
-  '🍣 Куда-нибудь необычное',
+// Каждая кнопка: { label, params, skipLocation, skipBudget }
+const POPULAR_CONFIG = [
+  { label: '👫 Пойти с друзьями',      params: {},                                    skipLocation: false, skipBudget: false },
+  { label: '🚶 Посидеть в центре',      params: { 'location[okrug][]': 11 },           skipLocation: true,  skipBudget: false },
+  { label: '🍷 Романтический ужин',     params: { 'good_for[]': 30 },                  skipLocation: false, skipBudget: false },
+  { label: '👶 С детьми',               params: { 'options[kid]': 'on' },              skipLocation: false, skipBudget: false },
+  { label: '💼 Деловая встреча',        params: { 'options[lunch]': 'on' },            skipLocation: false, skipBudget: false },
+  { label: '🍻 Выпить после работы',    params: { 'options[beer]': 'on', 'options[bar_desk]': 'on' }, skipLocation: false, skipBudget: false },
+  { label: '🎤 Попеть в караоке',       params: { 'options[karaoke]': 'on' },          skipLocation: false, skipBudget: false },
+  { label: '🌿 С верандой',             params: { 'options[veranda]': 'on' },          skipLocation: false, skipBudget: false },
+  { label: '🎸 Живая музыка',           params: { 'options[live_music]': 'on' },       skipLocation: false, skipBudget: false },
+  { label: '🕺 Потанцевать',            params: { 'options[dancefloor]': 'on', 'options[dj]': 'on' }, skipLocation: false, skipBudget: false },
 ];
+const POPULAR = POPULAR_CONFIG.map(p => p.label);
 
 function mainKeyboard() {
   return Markup.keyboard([...POPULAR.map(p => [p]), ['🟢 Открыто сейчас','🤔 Задай мне 5 вопросов'], ['📋 Мои подписки','❤️ Избранное'], ['🔄 Новый поиск']]).resize();
@@ -680,9 +705,15 @@ bot.on('text', async ctx => {
     return await runWizard(ctx, userId);
   }
 
-  // Популярные → сразу wizard с шага 1
+  // Популярные → wizard с предзаполненными параметрами
   if (POPULAR.includes(text)) {
-    wizards[userId] = { step: 1, answers: { occasion: text } };
+    const cfg = POPULAR_CONFIG.find(p => p.label === text);
+    wizards[userId] = {
+      step: cfg.skipBudget ? (cfg.skipLocation ? 3 : 2) : 1,
+      answers: { occasion: text },
+      preParams: cfg.params,
+      skipLocation: cfg.skipLocation,
+    };
     return await runWizard(ctx, userId);
   }
 
