@@ -386,18 +386,27 @@ async function buildCollectionParams(col) {
 // ─── Форматирование ───────────────────────────────────────────────────────────
 function formatBar(bar, index) {
   const stars = bar.rating >= 9 ? '🌟' : bar.rating >= 7 ? '⭐' : '✨';
+  const rating  = bar.rating   ? stars + ' *' + bar.rating + '* (' + bar.reviews_count + ' отз.)' : '';
+  const check   = bar.avg_check ? '💰 ' + bar.avg_check + ' руб.' : '';
+  const metro   = bar.metro    ? '🚇 ' + bar.metro + (bar.metro_distance_m ? ' · ' + bar.metro_distance_m + ' м' : '') : '';
+  const cuisine = bar.cuisine && bar.cuisine.length ? '🍽 ' + bar.cuisine.slice(0, 3).join(', ') : '';
+  const address = bar.address  ? '📍 ' + bar.address : '';
+  const desc    = bar.description ? '❝ ' + bar.description.trim() + ' ❞' : '';
+  const features = bar.features && bar.features.length ? '✨ ' + bar.features.slice(0, 4).join(' · ') : '';
+  const hours   = bar.schedule ? formatWorkingHours(bar.schedule) : '';
+  const phone   = bar.phone   ? '📞 [' + bar.phone + '](tel:' + bar.phone.replace(/[^+\d]/g, '') + ')' : '';
+
   const lines = [
-    '*' + index + '. ' + bar.name + '*',
-    bar.rating ? stars + ' *' + bar.rating + '* (' + bar.reviews_count + ' отз.)' : '',
-    bar.avg_check ? '💰 ' + bar.avg_check + ' руб.' : '',
-    bar.metro ? '🚇 ' + bar.metro + (bar.metro_distance_m ? ' · ' + bar.metro_distance_m + ' м' : '') : '',
-    bar.cuisine && bar.cuisine.length ? '🍽 ' + bar.cuisine.slice(0, 3).join(', ') : '',
-    bar.description ? '_' + bar.description.trim() + '_' : '',
-    bar.features && bar.features.length ? '✨ ' + bar.features.slice(0, 4).join(' · ') : '',
-    bar.schedule ? formatWorkingHours(bar.schedule) : '',
-    bar.uroven_shuma ? '🔊 Уровень шума: ' + bar.uroven_shuma : '',
-    bar.phone ? '📞 [' + bar.phone + '](tel:' + bar.phone.replace(/[^+\d]/g, '') + ')' : '',
+    '┌ *' + index + '. ' + bar.name + '*',
+    [rating, check].filter(Boolean).map(s => '├ ' + s).join('\n'),
+    [metro, address].filter(Boolean).map(s => '├ ' + s).join('\n'),
+    cuisine ? '├ ' + cuisine : '',
+    desc    ? '├ ' + desc    : '',
+    hours   ? '├ ' + hours   : '',
+    features ? '├ ' + features : '',
+    phone   ? '└ ' + phone   : '',
   ].filter(Boolean);
+
   return lines.join('\n');
 }
 
@@ -407,12 +416,34 @@ function barInlineKeyboard(bar) {
   const base = cleanUrl(bar.url);
   const row1 = [];
   const row2 = [];
+
+  // Ссылка на сайт — всегда если есть url
   if (bar.url) row1.push(Markup.button.url('🌐 На сайте', bar.url));
-  if (base) row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
-  if (base) row2.push(Markup.button.url('💬 Отзывы' + (bar.reviews_count ? ' (' + bar.reviews_count + ')' : ''), base + '/otzyvy'));
+
+  // Меню — показываем только если есть поле has_menu или всегда (пока Макс не добавит флаг)
+  if (base && bar.has_menu !== false) {
+    row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
+  }
+
+  // Отзывы — только если reviews_count > 0
+  if (base && bar.reviews_count > 0) {
+    row2.push(Markup.button.url('💬 Отзывы (' + bar.reviews_count + ')', base + '/otzyvy'));
+  }
+
+  // Карта — если есть адрес
+  if (bar.address) {
+    const query = encodeURIComponent(bar.address);
+    row2.push(Markup.button.url('🗺 На карте', 'https://yandex.ru/maps/?text=' + query));
+  }
+
+  // Избранное — всегда
   row2.push(Markup.button.callback('❤️ В избранное', 'fav_' + bar.id));
-  if (bar.cuisine && bar.cuisine.length) row2.push(Markup.button.callback('🔁 Похожие', 'similar_' + bar.id));
-  return Markup.inlineKeyboard([row1, row2]);
+
+
+
+  // Собираем только непустые строки
+  const rows = [row1, row2].filter(r => r.length > 0);
+  return Markup.inlineKeyboard(rows);
 }
 
 function hasValidPhoto(url) { return url && url.startsWith('http') && !url.includes('placeholder') && !url.includes('localhost'); }
@@ -571,8 +602,34 @@ async function showResults(ctx, userId) {
         return;
       }
     }
-    return ctx.reply('Хм, по таким параметрам пока ничего 🤔\n\nПопробуйте другой район или бюджет:',
-      Markup.keyboard([['🤔 Задай мне 5 вопросов'],['🔄 Новый поиск']]).resize());
+    // Предлагаем 3 популярные подборки вместо тупика
+    const fallbackCols = [
+      { label: '⭐ Топ Москвы — лучшие по рейтингу', params: { 'sorting[rating]': 'desc' } },
+      { label: '🌿 Открытые веранды прямо сейчас',   params: { 'options[veranda]': 'on', 'opened_now': 'on', 'sorting[rating]': 'desc' } },
+      { label: '💰 Хорошие места до 1500 руб.',      params: { 'middleCheck[to]': 1500, 'sorting[rating]': 'desc' } },
+    ];
+
+    await ctx.reply(
+      'Хм, по таким параметрам пока ничего не нашлось 🤷\n\n' +
+      'Но не расстраивайтесь — вот три подборки, которые нравятся большинству:'
+    );
+
+    for (const col of fallbackCols) {
+      try {
+        const resp = await apiGet('/search', { ...col.params, page: 1, per_page: 1 });
+        const total = resp.data.meta?.total || 0;
+        if (total > 0) {
+          await ctx.reply(col.label + '  (' + total + ' заведений)',
+            Markup.inlineKeyboard([[Markup.button.callback('Показать →', 'col_' + encodeURIComponent(col.label))]]));
+        }
+      } catch(e) {
+        await ctx.reply(col.label, Markup.inlineKeyboard([[Markup.button.callback('Показать →', 'col_' + encodeURIComponent(col.label))]]));
+      }
+    }
+
+    await ctx.reply('Или попробуйте изменить запрос 👇',
+      Markup.keyboard([['🤔 Задай мне 5 вопросов'], ['🔄 Новый поиск']]).resize());
+    return;
   }
 
   const sorted = [...allBars.filter(b=>b.phone), ...allBars.filter(b=>!b.phone)].slice(0, 3);
@@ -744,6 +801,37 @@ bot.action(/^unsub_(\d+)$/, async ctx => {
     removeSub(ctx.from.id, label);
     await ctx.reply('Отписались от: ' + label);
   }
+});
+
+// Быстрые коллекции из заглушек
+const QUICK_COLS = {
+  'col_top':     { params: { 'sorting[rating]': 'desc' } },
+  'col_open':    { params: { 'opened_now': 'on', 'sorting[rating]': 'desc' } },
+  'col_veranda': { params: { 'options[veranda]': 'on', 'opened_now': 'on', 'sorting[rating]': 'desc' } },
+  'col_budget':  { params: { 'middleCheck[to]': 1500, 'sorting[rating]': 'desc' } },
+};
+
+bot.action(/^col_(.+)$/, async ctx => {
+  await ctx.answerCbQuery();
+  const key = ctx.match[1];
+  const userId = ctx.from.id;
+
+  // Сначала проверяем быстрые коллекции по ключу
+  if (QUICK_COLS[key]) {
+    sessions[userId] = { params: { ...QUICK_COLS[key].params }, page: 1, lastQuery: key };
+    return await showResults(ctx, userId);
+  }
+
+  // Потом ищем по label в COLLECTIONS
+  const label = decodeURIComponent(key);
+  const col = COLLECTIONS.find(c => c.label === label) || getTimeCollections().find(c => c.label === label);
+  if (col) {
+    const params = await buildCollectionParams(col);
+    sessions[userId] = { params, page: 1, lastQuery: label };
+    return await showResults(ctx, userId);
+  }
+
+  await ctx.reply('Не удалось загрузить подборку. Попробуйте ещё раз.');
 });
 
 // Геолокация
@@ -936,7 +1024,14 @@ bot.on('text', async ctx => {
     console.log('Intent:', JSON.stringify(intent));
 
     if (intent.off_topic) {
-      return ctx.reply('Я специализируюсь только на поиске ресторанов, кафе и баров.\n\nНапишите что-нибудь вроде «бар с живой музыкой» или выберите подборку 👇', mainKeyboard());
+      await ctx.reply(
+        'Это немного не по моей части 😅\n\n' +
+        'Я специализируюсь на ресторанах и барах. Но вот что могу предложить прямо сейчас:'
+      );
+      await ctx.reply('⭐ Топ заведений Москвы', Markup.inlineKeyboard([[Markup.button.callback('Показать →', 'col_top')]]));
+      await ctx.reply('🌆 Открыто сейчас', Markup.inlineKeyboard([[Markup.button.callback('Показать →', 'col_open')]]));
+      await ctx.reply('Или напишите что ищете 👇', mainKeyboard());
+      return;
     }
 
     if (intent.clarify && (intent.confidence || 1) < 0.7) {
@@ -945,8 +1040,19 @@ bot.on('text', async ctx => {
     }
 
     if ((intent.confidence || 1) < 0.4) {
-      return ctx.reply('Не совсем понял запрос.\n\nПопробуйте: «Ресторан у метро Тверская до 2000 руб» или нажмите «Задай мне 5 вопросов» 👇',
-        Markup.keyboard([['🤔 Задай мне 5 вопросов'],['🔄 Новый поиск']]).resize());
+      await ctx.reply(
+        'Не совсем понял запрос 🤔\n\n' +
+        'Попробуйте написать иначе, например:\n' +
+        '• «Бар у Арбатской»\n' +
+        '• «Грузинский ресторан до 2000 руб»\n\n' +
+        'Или выберите готовую подборку:'
+      );
+      await ctx.reply('⭐ Топ Москвы по рейтингу', Markup.inlineKeyboard([[Markup.button.callback('Показать →', 'col_top')]]));
+      await ctx.reply('🌸 Открытые веранды', Markup.inlineKeyboard([[Markup.button.callback('Показать →', 'col_veranda')]]));
+      await ctx.reply('💰 Хорошие места до 1500 руб', Markup.inlineKeyboard([[Markup.button.callback('Показать →', 'col_budget')]]));
+      await ctx.reply('Или пройдите пошаговый подбор 👇',
+        Markup.keyboard([['🤔 Задай мне 5 вопросов'], ['🔄 Новый поиск']]).resize());
+      return;
     }
 
     const params = buildParams(intent);
