@@ -442,9 +442,9 @@ function barInlineKeyboard(bar) {
     row2.push(Markup.button.url('💬 Отзывы (' + bar.reviews_count + ')', base + '/otzyvy'));
   }
 
-  // Карта — если есть адрес
-  if (bar.address) {
-    const query = encodeURIComponent(bar.address);
+  // Карта — название + адрес для точного попадания
+  if (bar.address || bar.name) {
+    const query = encodeURIComponent((bar.name ? bar.name + ' ' : '') + (bar.address || ''));
     row2.push(Markup.button.url('🗺 На карте', 'https://yandex.ru/maps/?text=' + query));
   }
 
