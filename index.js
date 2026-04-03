@@ -184,6 +184,8 @@ async function parseIntent(userMessage) {
       + '14. "кейтеринг" -> catering:true\n'
       + '15. "недавно открылось" / "новое заведение" -> newest:true\n'
       + '16. "из сети Novikov" / "Ginza" -> chain_name:"Novikov Group"\n'
+      + '17. "ближайшие" / "рядом" -> sort:"nearest"\n'
+      + '18. "новые" / "недавно открылось" -> sort:"newest", newest:true\n'
       + '17. confidence: 0.9+=чёткий, 0.6-0.9=понятно, 0.3-0.6=размытый(+clarify), 0-0.3=off_topic\n\n'
       + 'ВЕРНИ ТОЛЬКО JSON (только заполненные поля):\n'
       + '{"metro_name":"...","metro_distance":500,"kitchen":"...","direction":"...","food":["..."],"type":"...","price_from":0,"price_to":0,"options":[],"good_for":"...","banket_for":"...","opened_now":true,"schedule_day":7,"schedule_time":"22:00","capacity_from":0,"capacity_to":0,"alco_with_self":1,"dostavka":true,"catering":true,"newest":true,"chain_name":"...","city":"spb","venue_name":"...","confidence":0.9,"off_topic":false,"clarify":"..."}';
@@ -259,6 +261,125 @@ function buildParams(intent) {
   if (intent.opened_now) params['opened_now'] = 'on';
   if (intent.city === 'spb') params['city'] = 'spb';
   if (Array.isArray(intent.options)) { for (const opt of intent.options) params['options[' + opt + ']'] = 'on'; }
+  // Координаты пользователя
+  if (intent.coords) {
+    params['coords[]'] = intent.coords;
+    params['radius'] = intent.radius || 2;
+  }
+  // Всегда сортируем по рейтингу
+  params['sorting[rating]'] = 'desc';
+  return params;
+}
+
+
+// ─── Часы работы ──────────────────────────────────────────────────────────────
+function formatWorkingHours(schedule) {
+  if (!schedule || !schedule.length) return '';
+  const now = new Date();
+  const moscowNow = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Moscow' }));
+  const dayOfWeek = moscowNow.getDay() || 7; // 1=Пн..7=Вс
+  const hours = moscowNow.getHours();
+  const minutes = moscowNow.getMinutes();
+  const currentMinutes = hours * 60 + minutes;
+
+  const today = schedule.find(s => s.day === dayOfWeek);
+  if (!today || !today.open || !today.close) return '';
+
+  const [openH, openM] = today.open.split(':').map(Number);
+  const [closeH, closeM] = today.close.split(':').map(Number);
+  const openMinutes  = openH * 60 + openM;
+  let   closeMinutes = closeH * 60 + closeM;
+  if (closeMinutes < openMinutes) closeMinutes += 24 * 60; // после полуночи
+
+  const isOpen = currentMinutes >= openMinutes && currentMinutes < closeMinutes;
+
+  function diffStr(diffMin) {
+    const h = Math.floor(diffMin / 60);
+    const m = diffMin % 60;
+    return h > 0 ? (h + ' ч ' + (m > 0 ? m + ' мин' : '')) : m + ' мин';
+  }
+
+  if (isOpen) {
+    const remaining = closeMinutes - currentMinutes;
+    return '🟢 Открыто · закроется через ' + diffStr(remaining) + ' (' + today.close + ')';
+  } else {
+    let untilOpen = openMinutes - currentMinutes;
+    if (untilOpen < 0) untilOpen += 24 * 60;
+    return '🔴 Закрыто · откроется через ' + diffStr(untilOpen) + ' (' + today.open + ')';
+  }
+}
+
+
+// ─── Контекст времени суток ───────────────────────────────────────────────────
+function getMoscowHour() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
+}
+
+function getTimeGreeting() {
+  const h = getMoscowHour();
+  if (h >= 5  && h < 11) return { emoji: '🌅', text: 'Доброе утро' };
+  if (h >= 11 && h < 17) return { emoji: '☀️', text: 'Добрый день' };
+  if (h >= 17 && h < 22) return { emoji: '🌆', text: 'Добрый вечер' };
+  return { emoji: '🌙', text: 'Доброй ночи' };
+}
+
+function getTimeCollections() {
+  const h = getMoscowHour();
+  if (h >= 5 && h < 11) return [
+    { label: '☕ Лучшие завтраки', params: { 'options[lunch]': 'on', 'sorting[rating]': 'desc' } },
+    { label: '🥐 Кофейня рядом',   params: { 'sorting[rating]': 'desc' }, type: 'кофейня' },
+  ];
+  if (h >= 11 && h < 16) return [
+    { label: '🍱 Бизнес-ланч',     params: { 'options[lunch]': 'on', 'sorting[rating]': 'desc' } },
+    { label: '💸 Обед до 1000 руб', params: { 'options[lunch]': 'on', 'middleCheck[to]': 1000, 'sorting[rating]': 'desc' } },
+  ];
+  if (h >= 16 && h < 22) return [
+    { label: '🍷 Ужин вечером',    params: { 'opened_now': 'on', 'sorting[rating]': 'desc' } },
+    { label: '🍻 Бар после работы', params: { 'opened_now': 'on', 'options[bar_desk]': 'on', 'sorting[rating]': 'desc' } },
+  ];
+  // Ночь
+  return [
+    { label: '🌙 Работает сейчас',  params: { 'opened_now': 'on', 'options[clock]': 'on', 'sorting[rating]': 'desc' } },
+    { label: '🕺 Клуб с DJ',        params: { 'opened_now': 'on', 'options[dj]': 'on', 'options[dancefloor]': 'on', 'sorting[rating]': 'desc' } },
+  ];
+}
+
+// Тематические коллекции (всегда)
+const COLLECTIONS = [
+  { label: '⭐ Топ Москвы',          params: { 'sorting[rating]': 'desc' } },
+  { label: '🆕 Новинки',             params: { newest: 1, 'sorting[rating]': 'desc' } },
+  { label: '🌿 Здоровое питание',    params: { 'options[sushi]': 'on', 'sorting[rating]': 'desc' } },
+  { label: '🎭 Шоу и развлечения',   params: { 'options[show]': 'on', 'options[live_music]': 'on', 'sorting[rating]': 'desc' } },
+  { label: '🍜 Азия',                params: { 'sorting[rating]': 'desc' }, kitchens: ['Японская','Китайская','Корейская','Тайская'] },
+  { label: '🥩 Мясо и огонь',        params: { 'sorting[rating]': 'desc' }, type: 'стейк' },
+  { label: '🍺 Крафтовое пиво',      params: { 'options[beer]': 'on', 'sorting[rating]': 'desc' } },
+  { label: '🌙 Ночная Москва',       params: { 'options[clock]': 'on', 'sorting[rating]': 'desc' } },
+  { label: '🐕 С собакой',           params: { 'sorting[rating]': 'desc' }, goodFor: 'собак' },
+  { label: '👤 Тихое место для себя', params: { 'options[sofa]': 'on', 'sorting[rating]': 'desc' } },
+  { label: '🌸 Веранды сейчас',      params: { 'options[veranda]': 'on', 'opened_now': 'on', 'sorting[rating]': 'desc' } },
+  { label: '🏆 С панорамным видом',  params: { 'sorting[rating]': 'desc' }, goodFor: 'панорам' },
+];
+
+async function buildCollectionParams(col) {
+  const params = { ...col.params };
+  // Тип заведения
+  if (col.type) {
+    const t = CACHE.types.find(x => x.name.toLowerCase().includes(col.type.toLowerCase()));
+    if (t) params['type[]'] = t.id;
+  }
+  // Кухни (массив)
+  if (col.kitchens) {
+    const ids = col.kitchens.map(name => {
+      const k = CACHE.kitchens.find(x => x.name.toLowerCase().includes(name.toLowerCase()));
+      return k ? k.id : null;
+    }).filter(Boolean);
+    if (ids.length) params['kitchen[]'] = ids[0]; // берём первую для простоты
+  }
+  // good_for
+  if (col.goodFor) {
+    const gf = CACHE.goodFor.find(x => x.name.toLowerCase().includes(col.goodFor.toLowerCase()));
+    if (gf) params['good_for[]'] = gf.id;
+  }
   return params;
 }
 
@@ -273,6 +394,8 @@ function formatBar(bar, index) {
     bar.cuisine && bar.cuisine.length ? '🍽 ' + bar.cuisine.slice(0, 3).join(', ') : '',
     bar.description ? '_' + bar.description.trim() + '_' : '',
     bar.features && bar.features.length ? '✨ ' + bar.features.slice(0, 4).join(' · ') : '',
+    bar.schedule ? formatWorkingHours(bar.schedule) : '',
+    bar.uroven_shuma ? '🔊 Уровень шума: ' + bar.uroven_shuma : '',
     bar.phone ? '📞 [' + bar.phone + '](tel:' + bar.phone.replace(/[^+\d]/g, '') + ')' : '',
   ].filter(Boolean);
   return lines.join('\n');
@@ -380,7 +503,15 @@ const POPULAR_CONFIG = [
 const POPULAR = POPULAR_CONFIG.map(p => p.label);
 
 function mainKeyboard() {
-  return Markup.keyboard([...POPULAR.map(p => [p]), ['🟢 Открыто сейчас','🤔 Задай мне 5 вопросов'], ['📋 Мои подписки','❤️ Избранное'], ['🔄 Новый поиск']]).resize();
+  const timeCols = getTimeCollections();
+  return Markup.keyboard([
+    ...POPULAR.map(p => [p]),
+    timeCols.map(c => c.label),
+    ['📍 Рядом со мной', '🟢 Открыто сейчас'],
+    ['🗂 Подборки', '🤔 Задай мне 5 вопросов'],
+    ['📋 Мои подписки', '❤️ Избранное'],
+    ['🔄 Новый поиск'],
+  ]).resize();
 }
 
 // ─── Показ результатов ────────────────────────────────────────────────────────
@@ -499,8 +630,9 @@ bot.start(async ctx => {
       new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }),
       { parse_mode: 'Markdown' }).catch(()=>{});
   }
+  const { emoji, text } = getTimeGreeting();
   await ctx.reply(
-    'Привет! 👋\n\n' +
+    emoji + ' ' + text + '! 👋\n\n' +
     'Я помогаю находить рестораны, кафе и бары в Москве и Санкт-Петербурге.\n\n' +
     'Умею подбирать по:\n' +
     '• Станции метро или округу\n' +
@@ -614,6 +746,18 @@ bot.action(/^unsub_(\d+)$/, async ctx => {
   }
 });
 
+// Геолокация
+bot.on('location', async ctx => {
+  const userId = ctx.from.id;
+  const { latitude, longitude } = ctx.message.location;
+  await ctx.reply('📍 Нашёл вашу геолокацию, ищу заведения рядом...');
+  sessions[userId] = {
+    params: { 'coords[]': [latitude, longitude], radius: 2, 'sorting[rating]': 'desc' },
+    page: 1, lastQuery: 'рядом со мной'
+  };
+  await showResults(ctx, userId);
+});
+
 // ─── Основной обработчик ──────────────────────────────────────────────────────
 bot.on('text', async ctx => {
   const userId = ctx.from.id;
@@ -625,6 +769,58 @@ bot.on('text', async ctx => {
     sessions[userId] = { params: city === 'spb' ? { city: 'spb' } : {}, page: 1, lastQuery: '', city };
     await ctx.reply('Отлично, ищем в ' + (city === 'spb' ? 'Петербурге' : 'Москве') + '! 🗺\n\nКуда хотите пойти? Напишите своими словами — или выберите из популярного:\n\n• Куда пойти с друзьями вечером\n• Погулять и зайти куда-нибудь в центре\n• Хочу что-то вкусное рядом с домом\n• Просто посидеть в хорошем месте\n• Куда сходить на выходных', mainKeyboard());
     return;
+  }
+
+  // Новые заведения
+  if (text === '🆕 Новые заведения') {
+    const base = sessions[userId]?.params || {};
+    sessions[userId] = { params: { ...base, newest: 1, sort: 'newest' }, page: 1, lastQuery: 'новые заведения' };
+    return await showResults(ctx, userId);
+  }
+
+  // Подборки — показываем меню коллекций
+  if (text === '🗂 Подборки') {
+    const timeCols = getTimeCollections();
+    const allCols = [...timeCols, ...COLLECTIONS];
+    const keyboard = allCols.map(c => [c.label]);
+    keyboard.push(['🔙 Назад']);
+    await ctx.reply(
+      '🗂 *Тематические подборки*\n\nВыберите что вас интересует:',
+      { parse_mode: 'Markdown', reply_markup: Markup.keyboard(keyboard).resize().reply_markup }
+    );
+    return;
+  }
+
+  if (text === '🔙 Назад') {
+    return ctx.reply('Что ищете?', mainKeyboard());
+  }
+
+  // Обработка нажатия на коллекцию
+  const timeCols = getTimeCollections();
+  const allCols = [...timeCols, ...COLLECTIONS];
+  const matchedCol = allCols.find(c => c.label === text);
+  if (matchedCol) {
+    const params = await buildCollectionParams(matchedCol);
+    sessions[userId] = { params, page: 1, lastQuery: matchedCol.label };
+    return await showResults(ctx, userId);
+  }
+
+  // Кнопка "Рядом со мной" - запрашиваем геолокацию
+  if (text === '📍 Рядом со мной') {
+    return ctx.reply(
+      'Поделитесь геолокацией — найду заведения рядом с вами 📍',
+      Markup.keyboard([[Markup.button.locationRequest('📍 Отправить моё местоположение')], ['❌ Отмена']]).resize()
+    );
+  }
+
+  // Геолокация
+  if (ctx.message?.location) {
+    const { latitude, longitude } = ctx.message.location;
+    sessions[userId] = {
+      params: { 'coords[]': [latitude, longitude], radius: 2, 'sorting[rating]': 'desc' },
+      page: 1, lastQuery: 'рядом со мной'
+    };
+    return await showResults(ctx, userId);
   }
 
   // Открыто сейчас (Feature 2)
