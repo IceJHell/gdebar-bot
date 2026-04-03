@@ -26,7 +26,7 @@ async function apiGet(url, params, retries = 2) {
 }
 
 // ─── Справочники ──────────────────────────────────────────────────────────────
-let CACHE = { metros: [], kitchens: [], types: [], goodFor: [] };
+let CACHE = { metros: [], kitchens: [], types: [], goodFor: [], kidOptions: [] };
 
 async function fetchOne(url, timeout = 60000) {
   const resp = await api.get(url, { timeout });
@@ -35,11 +35,11 @@ async function fetchOne(url, timeout = 60000) {
 
 async function loadCache() {
   console.log('Загружаю справочники...');
-  // Грузим каждый по отдельности с повторами чтобы не упасть всем сразу
-  const load = async (url, key) => {
+  const load = async (url, key, transform) => {
     for (let i = 1; i <= 5; i++) {
       try {
-        const data = await fetchOne(url, 60000);
+        const resp = await api.get(url, { timeout: 60000 });
+        const data = transform ? transform(resp.data) : (Array.isArray(resp.data) ? resp.data : (resp.data.data || []));
         CACHE[key] = data;
         console.log(key + ': ' + data.length);
         return;
@@ -56,6 +56,7 @@ async function loadCache() {
     load('/kitchens', 'kitchens'),
     load('/types', 'types'),
     load('/good-for', 'goodFor'),
+    load('/kid-options', 'kidOptions'),
   ]);
   console.log('Итого:', { metros: CACHE.metros.length, kitchens: CACHE.kitchens.length, types: CACHE.types.length, goodFor: CACHE.goodFor.length });
 }
@@ -260,6 +261,17 @@ function buildParams(intent) {
   if (intent.price_to)   params['middleCheck[to]']   = intent.price_to;
   if (intent.opened_now) params['opened_now'] = 'on';
   if (intent.city === 'spb') params['city'] = 'spb';
+
+  // Детские опции — пробуем найти конкретный подтип
+  if (intent.kid_type && CACHE.kidOptions.length) {
+    const kidOpt = CACHE.kidOptions.find(k => k.name.toLowerCase().includes(intent.kid_type.toLowerCase()));
+    if (kidOpt) {
+      params['options[kid][]'] = kidOpt.id;
+    } else {
+      params['options[kid]'] = 'on';
+    }
+  }
+
   if (Array.isArray(intent.options)) { for (const opt of intent.options) params['options[' + opt + ']'] = 'on'; }
   // Координаты пользователя
   if (intent.coords) {
@@ -632,7 +644,30 @@ async function showResults(ctx, userId) {
     return;
   }
 
-  const sorted = [...allBars.filter(b=>b.phone), ...allBars.filter(b=>!b.phone)].slice(0, 3);
+  // Пост-фильтр: убираем заведения не из того города/округа
+  let filteredBars = allBars;
+
+  // Если искали по округу — проверяем что заведение действительно из Москвы
+  if (session.params['location[okrug][]']) {
+    filteredBars = allBars.filter(b => {
+      // Исключаем если явно другой город (область)
+      if (b.location && b.location.city) {
+        const city = b.location.city.toLowerCase();
+        if (city.includes('петербург') || city.includes('мурино') || city.includes('всеволож')) return false;
+      }
+      if (b.url && b.url.includes('/spb/')) return false;
+      return true;
+    });
+    if (filteredBars.length === 0) filteredBars = allBars; // откат если всё отфильтровали
+  }
+
+  // Если искали Москву (нет city=spb) — убираем питерские заведения
+  if (!session.params['city']) {
+    filteredBars = filteredBars.filter(b => b.url ? !b.url.includes('/spb/') : true);
+    if (filteredBars.length === 0) filteredBars = allBars;
+  }
+
+  const sorted = [...filteredBars.filter(b=>b.phone), ...filteredBars.filter(b=>!b.phone)].slice(0, 3);
   if (isFirst) { trackQuery(ctx, session.lastQuery||'', sorted.length, session.params); await ctx.reply(rnd(MSG2)); await ctx.sendChatAction('typing'); await sleep(2500); }
 
   const offset = (session.page - 1) * 3;
@@ -666,11 +701,17 @@ async function showResults(ctx, userId) {
     ].filter(r => r.length > 0)).resize()
   );
 
-  // Отложенное сообщение через 10 сек
+  // Отложенное сообщение через 10 сек со ссылкой на сайт
   if (isFirst) {
+    const siteUrl = sorted.length > 0 && sorted[0].url ? sorted[0].url : 'https://www.gdebar.ru/?utm_campaign=tg_bot_ai';
     setTimeout(async () => {
       try {
-        await ctx.reply('Советую перейти на сайт — там полное меню, живые отзывы и форма бронирования.\nЕсли определились — звоните напрямую или бронируйте онлайн 👆');
+        await ctx.replyWithMarkdown(
+          'Советую перейти на сайт — там полное меню, живые отзывы и форма бронирования.\n' +
+          'Если определились — звоните напрямую или бронируйте онлайн 👆\n\n' +
+          '[Открыть GdeBar.ru ↗](https://www.gdebar.ru/?utm_campaign=tg_bot_ai)',
+          { disable_web_page_preview: true }
+        );
       } catch(e) {}
     }, 10000);
   }
@@ -854,7 +895,10 @@ bot.on('text', async ctx => {
   // Выбор города
   if (text === '🏙 Москва' || text === '🌊 Санкт-Петербург') {
     const city = text === '🌊 Санкт-Петербург' ? 'spb' : 'msk';
+    // Явно фиксируем город в сессии — для Москвы НЕ передаём city (по умолчанию Москва)
     sessions[userId] = { params: city === 'spb' ? { city: 'spb' } : {}, page: 1, lastQuery: '', city };
+    // Сохраняем выбранный город в сессии пользователя
+    sessions[userId].selectedCity = city;
     await ctx.reply('Отлично, ищем в ' + (city === 'spb' ? 'Петербурге' : 'Москве') + '! 🗺\n\nКуда хотите пойти? Напишите своими словами — или выберите из популярного:\n\n• Куда пойти с друзьями вечером\n• Погулять и зайти куда-нибудь в центре\n• Хочу что-то вкусное рядом с домом\n• Просто посидеть в хорошем месте\n• Куда сходить на выходных', mainKeyboard());
     return;
   }
