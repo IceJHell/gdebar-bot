@@ -455,7 +455,6 @@ function formatBar(bar, index) {
     desc    ? '├ ' + desc    : '',
     hours   ? '├ ' + hours   : '',
     features ? '├ ' + features : '',
-    hours   ? '├ ' + hours   : '',
     phone   ? '└ ' + phone   : '',
   ].filter(Boolean);
 
@@ -619,13 +618,17 @@ const POPULAR = POPULAR_CONFIG.map(p => p.label);
 
 function mainKeyboard() {
   const timeCols = getTimeCollections();
+  // По 2 кнопки в строку — больше видно сразу
+  const popularRows = [];
+  for (let i = 0; i < POPULAR.length; i += 2) {
+    popularRows.push(POPULAR.slice(i, i + 2));
+  }
   return Markup.keyboard([
-    ...POPULAR.map(p => [p]),
+    ...popularRows,
     timeCols.map(c => c.label),
     ['📍 Рядом со мной', '🟢 Открыто сейчас'],
     ['🗂 Подборки', '🤔 Задай мне 5 вопросов'],
-    ['📋 Мои подписки', '❤️ Избранное'],
-    ['🔄 Новый поиск'],
+    ['❤️ Избранное', '🔄 Новый поиск'],
   ]).resize();
 }
 
@@ -776,7 +779,7 @@ async function showResults(ctx, userId) {
   // Кнопка — открыть именно эту подборку на сайте
   const barIds = sorted.map(b => b.id).filter(Boolean);
   if (barIds.length > 0) {
-    const collectionUrl = 'https://www.gdebar.ru/bars?' + barIds.map(id => 'barIds[]=' + id).join('&') + '&utm_campaign=tg_bot_ai';
+    const collectionUrl = 'https://www.gdebar.ru/luchshie-zavedeniya?' + barIds.map(id => 'barIds[]=' + id).join('&') + '&utm_campaign=tg_bot_ai';
     await ctx.reply(
       'Смотрите эти заведения на сайте — там полное меню, фото и форма бронирования:',
       Markup.inlineKeyboard([[
@@ -801,12 +804,17 @@ bot.start(async ctx => {
   const { emoji, text } = getTimeGreeting();
   await ctx.reply(
     emoji + ' ' + text + '! 👋\n\n' +
-    'Я помогаю находить рестораны, кафе и бары в Москве и Санкт-Петербурге.\n\n' +
-    'Умею подбирать по:\n' +
-    '• Станции метро или округу\n' +
-    '• Типу кухни (грузинская, японская, итальянская...)\n' +
-    '• Бюджету на человека\n' +
-    '• Особенностям (кальян, веранда, живая музыка, дети, DJ...)\n\n' +
+    'Я AI-помощник GdeBar.ru — нахожу рестораны, кафе и бары в Москве и Петербурге.\n\n' +
+    'Вот что я умею:\n\n' +
+    '🔍 *Поиск по запросу* — просто напишите что хотите:\n' +
+    '«Грузинский ресторан у Арбатской до 2000 руб»\n' +
+    '«Бар с живой музыкой и кальяном вечером»\n' +
+    '«Куда пойти с детьми в выходной»\n' +
+    '«Ресторан Пушкинъ» — поиск по названию\n\n' +
+    '📍 *Рядом со мной* — найду заведения по вашей геолокации\n\n' +
+    '🗂 *Готовые подборки* — Топ Москвы, Новинки, Ночная Москва, Веранды, Азия и др.\n\n' +
+    '🎯 *Пошаговый подбор* — отвечаете на 3 вопроса, я подбираю точно\n\n' +
+    '❤️ *Избранное* — сохраняйте понравившиеся заведения\n\n' +
     'С какого города начнём?',
     Markup.keyboard([['🏙 Москва', '🌊 Санкт-Петербург']]).resize()
   );
