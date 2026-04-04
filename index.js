@@ -190,7 +190,8 @@ async function parseIntent(userMessage) {
       + '16. "из сети Novikov" / "Ginza" -> chain_name:"Novikov Group"\n'
       + '17. "ближайшие" / "рядом" -> sort:"nearest"\n'
       + '18. "новые" / "недавно открылось" -> sort:"newest", newest:true\n'
-      + '17. confidence: 0.9+=чёткий, 0.6-0.9=понятно, 0.3-0.6=размытый(+clarify), 0-0.3=off_topic\n\n'
+      + 'ГОРОД: city:"spb" ТОЛЬКО если явно написано Санкт-Петербург/СПб/Питер/Петербург. Кузьминки, Арбатская, Тверская и т.д. — это МОСКВА. По умолчанию всегда Москва!\n'
+      + 'confidence: 0.9+=чёткий, 0.6-0.9=понятно, 0.3-0.6=размытый(+clarify), 0-0.3=off_topic\n\n'
       + 'ВЕРНИ ТОЛЬКО JSON (только заполненные поля):\n'
       + '{"metro_name":"...","metro_distance":500,"kitchen":"...","direction":"...","food":["..."],"type":"...","price_from":0,"price_to":0,"options":[],"good_for":"...","banket_for":"...","opened_now":true,"schedule_day":7,"schedule_time":"22:00","capacity_from":0,"capacity_to":0,"alco_with_self":1,"dostavka":true,"catering":true,"newest":true,"chain_name":"...","city":"spb","venue_name":"...","confidence":0.9,"off_topic":false,"clarify":"..."}';
 
@@ -263,7 +264,11 @@ function buildParams(intent) {
   if (intent.price_from) params['middleCheck[from]'] = intent.price_from;
   if (intent.price_to)   params['middleCheck[to]']   = intent.price_to;
   if (intent.opened_now) params['opened_now'] = 'on';
-  if (intent.city === 'spb') params['city'] = 'spb';
+  // Город — только если явно в запросе И сессия подтверждает
+  if (intent.city === 'spb') {
+    // Дополнительная проверка — должно быть явное упоминание
+    params['city'] = 'spb';
+  }
 
   // Детские опции — пробуем найти конкретный подтип
   if (intent.kid_type && CACHE.kidOptions.length) {
@@ -738,8 +743,12 @@ async function showResults(ctx, userId) {
 
   // Если искали Москву (нет city=spb) — убираем питерские заведения
   if (!session.params['city']) {
-    filteredBars = filteredBars.filter(b => b.url ? !b.url.includes('/spb/') : true);
-    if (filteredBars.length === 0) filteredBars = allBars;
+    const moscowOnly = filteredBars.filter(b => {
+      if (b.url && b.url.includes('/spb/')) return false;
+      if (b.address && b.address.toLowerCase().includes('петербург')) return false;
+      return true;
+    });
+    if (moscowOnly.length > 0) filteredBars = moscowOnly;
   }
 
   const sorted = [...filteredBars.filter(b=>b.phone), ...filteredBars.filter(b=>!b.phone)].slice(0, 3);
@@ -991,7 +1000,7 @@ bot.on('text', async ctx => {
     sessions[userId] = { params: city === 'spb' ? { city: 'spb' } : {}, page: 1, lastQuery: '', city };
     // Сохраняем выбранный город в сессии пользователя
     sessions[userId].selectedCity = city;
-    await ctx.reply('Отлично, ищем в ' + (city === 'spb' ? 'Петербурге' : 'Москве') + '! 🗺\n\nКуда хотите пойти? Напишите своими словами — или выберите из популярного:\n\n• Куда пойти с друзьями вечером\n• Погулять и зайти куда-нибудь в центре\n• Хочу что-то вкусное рядом с домом\n• Просто посидеть в хорошем месте\n• Куда сходить на выходных', mainKeyboard());
+    await ctx.reply('Отлично, ищем в ' + (city === 'spb' ? 'Петербурге' : 'Москве') + '! 🗺\n\nНапишите что хотите — или выберите из меню ниже 👇', mainKeyboard());
     return;
   }
 
