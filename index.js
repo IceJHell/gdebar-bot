@@ -26,7 +26,7 @@ async function apiGet(url, params, retries = 2) {
 }
 
 // ─── Справочники ──────────────────────────────────────────────────────────────
-let CACHE = { metros: [], kitchens: [], types: [], goodFor: [], kidOptions: [] };
+let CACHE = { metros: [], kitchens: [], types: [], goodFor: [], kidOptions: [], okrugMsk: [], okrugSpb: [], metroSpb: [] };
 
 async function fetchOne(url, timeout = 60000) {
   const resp = await api.get(url, { timeout });
@@ -53,10 +53,13 @@ async function loadCache() {
 
   await Promise.all([
     load('/metros', 'metros'),
+    load('/metros?city=spb', 'metroSpb'),
     load('/kitchens', 'kitchens'),
     load('/types', 'types'),
     load('/good-for', 'goodFor'),
     load('/kid-options', 'kidOptions'),
+    load('/locations?type=okrug', 'okrugMsk'),
+    load('/locations?type=okrug&city=spb', 'okrugSpb'),
   ]);
   console.log('Итого:', { metros: CACHE.metros.length, kitchens: CACHE.kitchens.length, types: CACHE.types.length, goodFor: CACHE.goodFor.length });
 }
@@ -395,6 +398,42 @@ async function buildCollectionParams(col) {
   return params;
 }
 
+
+// Детали опции заведения через отдельный эндпоинт
+async function getBarFeatures(barId) {
+  try {
+    const resp = await api.get('/bar/' + barId + '/features', { timeout: 15000 });
+    return resp.data || null;
+  } catch(e) { return null; }
+}
+
+function formatFeatureDetails(features, type) {
+  if (!features || !features[type]) return '';
+  const d = features[type];
+  const lines = [];
+  if (type === 'hookah' && d.items && d.items.length)
+    lines.push('Кальяны: ' + d.items.slice(0,3).map(i => i.name + (i.price ? ' ' + i.price + '₽' : '')).join(', '));
+  if (type === 'veranda') {
+    if (d.type) lines.push('Тип: ' + d.type);
+    if (d.conveniences && d.conveniences.length) lines.push('Удобства: ' + d.conveniences.slice(0,3).join(', '));
+  }
+  if (type === 'live_music') {
+    if (d.directions && d.directions.length) lines.push('Стиль: ' + d.directions.slice(0,3).join(', '));
+    if (d.instruments && d.instruments.length) lines.push('Инструменты: ' + d.instruments.slice(0,3).join(', '));
+  }
+  if (type === 'lunch') {
+    if (d.price_from && d.price_to) lines.push('Цена: ' + d.price_from + '–' + d.price_to + '₽');
+    if (d.schedule) lines.push('Время: ' + d.schedule);
+  }
+  if (type === 'parking') {
+    if (d.type) lines.push('Тип: ' + d.type);
+    if (d.payment === 0) lines.push('Бесплатная');
+    else if (d.payment) lines.push('Платная');
+  }
+  if (type === 'karaoke' && d.rooms) lines.push('Залов: ' + d.rooms.length);
+  return lines.join(' · ');
+}
+
 // ─── Форматирование ───────────────────────────────────────────────────────────
 function formatBar(bar, index) {
   const stars = bar.rating >= 9 ? '🌟' : bar.rating >= 7 ? '⭐' : '✨';
@@ -416,6 +455,7 @@ function formatBar(bar, index) {
     desc    ? '├ ' + desc    : '',
     hours   ? '├ ' + hours   : '',
     features ? '├ ' + features : '',
+    hours   ? '├ ' + hours   : '',
     phone   ? '└ ' + phone   : '',
   ].filter(Boolean);
 
@@ -433,7 +473,7 @@ function barInlineKeyboard(bar) {
   if (bar.url) row1.push(Markup.button.url('🌐 На сайте', bar.url));
 
   // Меню — показываем только если есть поле has_menu или всегда (пока Макс не добавит флаг)
-  if (base && bar.has_menu !== false) {
+  if (base && bar.has_menu) {
     row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
   }
 
@@ -487,8 +527,24 @@ async function runWizard(ctx, userId) {
   } else if (w.step === 2) {
     // Если локация уже задана — пропускаем
     if (w.skipLocation) { w.step = 3; return await runWizard(ctx, userId); }
-    await ctx.reply('Почти готово!\n\nВ каком районе ищем? Выберите округ или напишите метро:',
-      Markup.keyboard([['ЦАО','ЗАО','САО'],['ЮЗАО','ЮАО','СВАО'],['ВАО','ЮВАО','СЗАО'],['Не важно'],['❌ Отмена']]).resize());
+
+    const isSpb = sessions[userId]?.selectedCity === 'spb';
+    const metroHint = isSpb ? 'Введите станцию метро Петербурга...' : 'Введите станцию метро Москвы...';
+
+    let districtKeyboard;
+    if (isSpb) {
+      // Питерские районы — берём из кэша или хардкодим основные
+      const spbDistricts = CACHE.okrugSpb.length
+        ? CACHE.okrugSpb.slice(0, 9).map(d => d.name)
+        : ['Центральный','Василеостровский','Адмиралтейский','Петроградский','Невский','Московский','Приморский','Выборгский','Красногвардейский'];
+      const rows = [];
+      for (let i = 0; i < spbDistricts.length; i += 3) rows.push(spbDistricts.slice(i, i+3));
+      rows.push(['Не важно'], ['❌ Отмена']);
+      districtKeyboard = Markup.keyboard(rows).resize();
+    } else {
+      districtKeyboard = Markup.keyboard([['ЦАО','ЗАО','САО'],['ЮЗАО','ЮАО','СВАО'],['ВАО','ЮВАО','СЗАО'],['Не важно'],['❌ Отмена']]).resize();
+    }
+    await ctx.reply('Почти готово!\n\nВ каком районе ищем? Выберите район или напишите метро:', districtKeyboard);
   } else {
     delete wizards[userId];
     const { occasion, budget, location } = w.answers;
@@ -497,15 +553,31 @@ async function runWizard(ctx, userId) {
     // Строим параметры: preParams (из кнопки) + бюджет + локация
     const params = Object.assign({}, w.preParams || {});
 
-    // Округ
-    if (location && okrugMap[location]) params['location[okrug][]'] = okrugMap[location];
-    // Метро (если написал текстом)
-    if (location && !okrugMap[location] && !['Не важно','❌ Отмена'].includes(location)) {
-      const n = location.toLowerCase().trim();
-      const metro = CACHE.metros.find(m => m.name.toLowerCase() === n)
-        || CACHE.metros.find(m => m.name.toLowerCase().startsWith(n))
-        || CACHE.metros.find(m => m.name.toLowerCase().includes(n));
-      if (metro) params['metro[]'] = metro.id;
+    // Город из сессии
+    const isSpb = sessions[userId]?.selectedCity === 'spb';
+    if (isSpb) params['city'] = 'spb';
+
+    // Округ / район
+    const metroList = isSpb ? CACHE.metroSpb : CACHE.metros;
+    const okrugList = isSpb ? CACHE.okrugSpb : CACHE.okrugMsk;
+
+    if (location && !['Не важно','❌ Отмена'].includes(location)) {
+      // Ищем в округах
+      if (okrugMap[location]) {
+        params['location[okrug][]'] = okrugMap[location];
+      } else {
+        const okrug = okrugList.find(o => o.name.toLowerCase().includes(location.toLowerCase()));
+        if (okrug) {
+          params['location[okrug][]'] = okrug.id;
+        } else {
+          // Ищем в метро
+          const n = location.toLowerCase().trim();
+          const metro = metroList.find(m => m.name.toLowerCase() === n)
+            || metroList.find(m => m.name.toLowerCase().startsWith(n))
+            || metroList.find(m => m.name.toLowerCase().includes(n));
+          if (metro) params['metro[]'] = metro.id;
+        }
+      }
     }
 
     // Бюджет
@@ -701,20 +773,18 @@ async function showResults(ctx, userId) {
     ].filter(r => r.length > 0)).resize()
   );
 
-  // Отложенное сообщение через 10 сек со ссылкой на сайт
-  if (isFirst) {
-    const siteUrl = sorted.length > 0 && sorted[0].url ? sorted[0].url : 'https://www.gdebar.ru/?utm_campaign=tg_bot_ai';
-    setTimeout(async () => {
-      try {
-        await ctx.replyWithMarkdown(
-          'Советую перейти на сайт — там полное меню, живые отзывы и форма бронирования.\n' +
-          'Если определились — звоните напрямую или бронируйте онлайн 👆\n\n' +
-          '[Открыть GdeBar.ru ↗](https://www.gdebar.ru/?utm_campaign=tg_bot_ai)',
-          { disable_web_page_preview: true }
-        );
-      } catch(e) {}
-    }, 10000);
+  // Кнопка — открыть именно эту подборку на сайте
+  const barIds = sorted.map(b => b.id).filter(Boolean);
+  if (barIds.length > 0) {
+    const collectionUrl = 'https://www.gdebar.ru/bars?' + barIds.map(id => 'barIds[]=' + id).join('&') + '&utm_campaign=tg_bot_ai';
+    await ctx.reply(
+      'Смотрите эти заведения на сайте — там полное меню, фото и форма бронирования:',
+      Markup.inlineKeyboard([[
+        Markup.button.url('Открыть подборку на GdeBar.ru ↗', collectionUrl)
+      ]])
+    );
   }
+
 }
 
 // ─── Команды ──────────────────────────────────────────────────────────────────
@@ -842,6 +912,20 @@ bot.action(/^unsub_(\d+)$/, async ctx => {
     removeSub(ctx.from.id, label);
     await ctx.reply('Отписались от: ' + label);
   }
+});
+
+
+// Детали опции — callback
+bot.action(/^feat_(\d+)_(.+)$/, async ctx => {
+  await ctx.answerCbQuery('Загружаю...');
+  const barId = ctx.match[1];
+  const featType = ctx.match[2];
+  const features = await getBarFeatures(barId);
+  if (!features) return ctx.reply('Детали недоступны. Смотрите на сайте заведения.');
+  const detail = formatFeatureDetails(features, featType);
+  const bar = barCache[parseInt(barId)];
+  const name = bar ? bar.name : 'Заведение';
+  await ctx.reply(detail ? name + '\n\n' + detail : 'Подробная информация на сайте заведения.');
 });
 
 // Быстрые коллекции из заглушек
