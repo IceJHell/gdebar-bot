@@ -298,32 +298,38 @@ function formatWorkingHours(schedule) {
   const now = new Date();
   const moscowNow = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Moscow' }));
   const dayOfWeek = moscowNow.getDay() || 7; // 1=Пн..7=Вс
-  const hours = moscowNow.getHours();
-  const minutes = moscowNow.getMinutes();
-  const currentMinutes = hours * 60 + minutes;
+  const curMin = moscowNow.getHours() * 60 + moscowNow.getMinutes();
 
   const today = schedule.find(s => s.day === dayOfWeek);
-  if (!today || !today.open || !today.close) return '';
+  if (!today) return '';
+
+  // Выходной
+  if (today.day_off) return '🔴 Сегодня выходной';
+
+  // Круглосуточно
+  if (today.all_day) return '🟢 Круглосуточно';
+
+  if (!today.open || !today.close) return '';
 
   const [openH, openM] = today.open.split(':').map(Number);
   const [closeH, closeM] = today.close.split(':').map(Number);
-  const openMinutes  = openH * 60 + openM;
-  let   closeMinutes = closeH * 60 + closeM;
-  if (closeMinutes < openMinutes) closeMinutes += 24 * 60; // после полуночи
+  const openMin  = openH * 60 + openM;
+  let   closeMin = closeH * 60 + closeM;
+  if (closeMin < openMin) closeMin += 24 * 60; // после полуночи
 
-  const isOpen = currentMinutes >= openMinutes && currentMinutes < closeMinutes;
+  const isOpen = curMin >= openMin && curMin < closeMin;
 
-  function diffStr(diffMin) {
-    const h = Math.floor(diffMin / 60);
-    const m = diffMin % 60;
-    return h > 0 ? (h + ' ч ' + (m > 0 ? m + ' мин' : '')) : m + ' мин';
+  function diffStr(d) {
+    const h = Math.floor(d / 60), m = d % 60;
+    return h > 0 ? h + ' ч' + (m > 0 ? ' ' + m + ' мин' : '') : m + ' мин';
   }
 
   if (isOpen) {
-    const remaining = closeMinutes - currentMinutes;
-    return '🟢 Открыто · закроется через ' + diffStr(remaining) + ' (' + today.close + ')';
+    const remaining = closeMin - curMin;
+    const closeSuffix = today.last_client ? today.close + ', до последнего гостя' : today.close;
+    return '🟢 Открыто · закроется через ' + diffStr(remaining) + ' (' + closeSuffix + ')';
   } else {
-    let untilOpen = openMinutes - currentMinutes;
+    let untilOpen = openMin - curMin;
     if (untilOpen < 0) untilOpen += 24 * 60;
     return '🔴 Закрыто · откроется через ' + diffStr(untilOpen) + ' (' + today.open + ')';
   }
@@ -416,27 +422,90 @@ function formatFeatureDetails(features, type) {
   if (!features || !features[type]) return '';
   const d = features[type];
   const lines = [];
-  if (type === 'hookah' && d.items && d.items.length)
-    lines.push('Кальяны: ' + d.items.slice(0,3).map(i => i.name + (i.price ? ' ' + i.price + '₽' : '')).join(', '));
-  if (type === 'veranda') {
-    if (d.type) lines.push('Тип: ' + d.type);
-    if (d.conveniences && d.conveniences.length) lines.push('Удобства: ' + d.conveniences.slice(0,3).join(', '));
+
+  if (type === 'hookah') {
+    if (d.items && d.items.length)
+      lines.push('🪔 Кальяны: ' + d.items.slice(0,5).map(i => i.name + (i.price ? ' — ' + i.price + '₽' : '')).join(', '));
+    if (d.schedule && d.schedule.length) {
+      const s = d.schedule[0];
+      if (s.time_from && s.time_to) lines.push('🕐 Время: ' + s.time_from + '–' + s.time_to);
+    }
+  }
+  if (type === 'veranda' && Array.isArray(d)) {
+    d.slice(0,3).forEach(v => {
+      const parts = [v.name || v.type].filter(Boolean);
+      if (v.capacity) parts.push(v.capacity + ' мест');
+      if (v.convenience) parts.push(v.convenience);
+      lines.push('🌿 ' + parts.join(' · '));
+    });
   }
   if (type === 'live_music') {
-    if (d.directions && d.directions.length) lines.push('Стиль: ' + d.directions.slice(0,3).join(', '));
-    if (d.instruments && d.instruments.length) lines.push('Инструменты: ' + d.instruments.slice(0,3).join(', '));
+    if (d.directions && d.directions.length) lines.push('🎵 Стиль: ' + d.directions.slice(0,4).join(', '));
+    if (d.instruments && d.instruments.length) lines.push('🎸 Инструменты: ' + d.instruments.slice(0,4).join(', '));
   }
   if (type === 'lunch') {
-    if (d.price_from && d.price_to) lines.push('Цена: ' + d.price_from + '–' + d.price_to + '₽');
-    if (d.schedule) lines.push('Время: ' + d.schedule);
+    if (d.price) lines.push('💰 Цена: ' + d.price + ' руб.');
+    if (d.schedule) {
+      const s = d.schedule;
+      const days = ['','Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+      if (s.day_from && s.day_to) lines.push('📅 ' + days[s.day_from] + '–' + days[s.day_to] + ', ' + (s.time_from||'') + '–' + (s.time_to||''));
+    }
+  }
+  if (type === 'beer') {
+    if (d.name) lines.push('🍺 ' + d.name + (d.volume ? ', ' + d.volume : '') + (d.price ? ' — ' + d.price + '₽' : ''));
   }
   if (type === 'parking') {
-    if (d.type) lines.push('Тип: ' + d.type);
-    if (d.payment === 0) lines.push('Бесплатная');
-    else if (d.payment) lines.push('Платная');
+    if (d.type) lines.push('🅿️ Тип: ' + d.type);
+    if (d.payment) lines.push(d.payment === 'free' || d.payment === '0' ? 'Бесплатная' : 'Платная' + (d.price ? ' · ' + d.price + '₽' : ''));
+    if (d.belong) lines.push('Принадлежность: ' + d.belong);
   }
-  if (type === 'karaoke' && d.rooms) lines.push('Залов: ' + d.rooms.length);
-  return lines.join(' · ');
+  if (type === 'kid') {
+    if (d.age) {
+      if (d.age.no_limit) lines.push('👶 Возраст: без ограничений');
+      else if (d.age.from !== undefined) lines.push('👶 Возраст: ' + d.age.from + '–' + (d.age.to || '?') + ' лет');
+    }
+    if (d.items && d.items.length)
+      lines.push('🎠 Активности: ' + d.items.slice(0,4).map(i => i.name + (i.price ? ' ' + i.price + '₽' : '')).join(', '));
+  }
+  if (type === 'game' && Array.isArray(d)) lines.push('🎮 Игры: ' + d.slice(0,6).join(', '));
+  if (type === 'show' && Array.isArray(d)) {
+    d.slice(0,3).forEach(s => lines.push('🎭 ' + s.name + (s.price ? ' — ' + s.price + '₽' : '')));
+  }
+  if (type === 'video') {
+    if (d.screens) lines.push('📺 Экранов: ' + d.screens);
+    if (d.projector) lines.push('+ проектор');
+    if (d.types && d.types.length) lines.push('Трансляции: ' + d.types.join(', '));
+  }
+  if (type === 'sofa' && d.count) lines.push('🛋 Диванчиков: ' + d.count);
+  if (type === 'wifi' && d.sockets) lines.push('📶 Розеток: ' + d.sockets);
+  if (type === 'billiard') {
+    if (d.types && d.types.length) lines.push('🎱 Столы: ' + d.types.join(', '));
+    if (d.comment) lines.push(d.comment);
+  }
+  if (type === 'bowling') {
+    if (d.lanes) lines.push('🎳 Дорожек: ' + d.lanes);
+    if (d.comment) lines.push(d.comment);
+  }
+  if (type === 'karaoke' && Array.isArray(d)) {
+    d.slice(0,3).forEach(r => {
+      const parts = [r.name || 'Зал'].filter(Boolean);
+      if (r.capacity) parts.push(r.capacity + ' мест');
+      if (r.features && r.features.length) parts.push(r.features.slice(0,2).join(', '));
+      lines.push('🎤 ' + parts.join(' · '));
+    });
+  }
+  if (type === 'kabinki' && Array.isArray(d)) {
+    d.slice(0,3).forEach(k => lines.push('🚪 ' + (k.name||'Кабинка') + (k.capacity ? ' · ' + k.capacity + ' мест' : '')));
+  }
+  if (type === 'dancefloor' && Array.isArray(d)) {
+    d.slice(0,2).forEach(df => {
+      const parts = [df.hall || 'Танцпол'];
+      if (df.capacity) parts.push(df.capacity + ' чел.');
+      lines.push('🕺 ' + parts.join(' · '));
+    });
+  }
+
+  return lines.join('\n');
 }
 
 // ─── Форматирование ───────────────────────────────────────────────────────────
@@ -473,33 +542,17 @@ function barInlineKeyboard(bar) {
   const row1 = [];
   const row2 = [];
 
-  // Ссылка на сайт — всегда если есть url
   if (bar.url) row1.push(Markup.button.url('🌐 На сайте', bar.url));
-
-  // Меню — показываем только если есть поле has_menu или всегда (пока Макс не добавит флаг)
-  if (base && bar.has_menu) {
-    row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
+  if (base && bar.has_menu) row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
+  if (base && bar.reviews_count > 0) row2.push(Markup.button.url('💬 Отзывы (' + bar.reviews_count + ')', base + '/otzyvy'));
+  // Карта — на страницу заведения, там есть карта + клик остаётся у GdeBar
+  if (bar.url) {
+    const mapUrl = cleanUrl(bar.url) + '#map';
+    row2.push(Markup.button.url('🗺 На карте', mapUrl));
   }
-
-  // Отзывы — только если reviews_count > 0
-  if (base && bar.reviews_count > 0) {
-    row2.push(Markup.button.url('💬 Отзывы (' + bar.reviews_count + ')', base + '/otzyvy'));
-  }
-
-  // Карта — название + адрес для точного попадания
-  if (bar.address || bar.name) {
-    const query = encodeURIComponent((bar.name ? bar.name + ' ' : '') + (bar.address || ''));
-    row2.push(Markup.button.url('🗺 На карте', 'https://yandex.ru/maps/?text=' + query));
-  }
-
-  // Избранное — всегда
   row2.push(Markup.button.callback('❤️ В избранное', 'fav_' + bar.id));
 
-
-
-  // Собираем только непустые строки
-  const rows = [row1, row2].filter(r => r.length > 0);
-  return Markup.inlineKeyboard(rows);
+  return Markup.inlineKeyboard([row1, row2].filter(r => r.length > 0));
 }
 
 function hasValidPhoto(url) { return url && url.startsWith('http') && !url.includes('placeholder') && !url.includes('localhost'); }
@@ -681,7 +734,7 @@ async function showResults(ctx, userId) {
       if (retryBars.length > 0) {
         await ctx.reply('По точному запросу не нашлось — ' + msg + ' 🔍');
         session.params = relaxed;
-        const sorted2 = [...retryBars.filter(b=>b.phone), ...retryBars.filter(b=>!b.phone)].slice(0, 3);
+        const sorted2 = retryBars.slice(0, 3);
         if (isFirst) { trackQuery(ctx, session.lastQuery||'', sorted2.length, relaxed); await ctx.reply(rnd(MSG2)); await ctx.sendChatAction('typing'); await sleep(2000); }
         for (let i = 0; i < sorted2.length; i++) {
           const bar = sorted2[i]; barCache[bar.id] = bar;
@@ -751,7 +804,7 @@ async function showResults(ctx, userId) {
     if (moscowOnly.length > 0) filteredBars = moscowOnly;
   }
 
-  const sorted = [...filteredBars.filter(b=>b.phone), ...filteredBars.filter(b=>!b.phone)].slice(0, 3);
+  const sorted = filteredBars.slice(0, 3);
   if (isFirst) { trackQuery(ctx, session.lastQuery||'', sorted.length, session.params); await ctx.reply(rnd(MSG2)); await ctx.sendChatAction('typing'); await sleep(2500); }
 
   const offset = (session.page - 1) * 3;
@@ -785,10 +838,27 @@ async function showResults(ctx, userId) {
     ].filter(r => r.length > 0)).resize()
   );
 
-  // Кнопка — открыть именно эту подборку на сайте
+  // Кнопка — открыть подборку на сайте по параметрам запроса
   const barIds = sorted.map(b => b.id).filter(Boolean);
   if (barIds.length > 0) {
-    const collectionUrl = 'https://www.gdebar.ru/luchshie-zavedeniya?' + barIds.map(id => 'barIds[]=' + id).join('&') + '&utm_campaign=tg_bot_ai';
+    // Если есть конкретные ID — показываем только их
+    // Если запрос широкий — передаём параметры поиска чтобы показать все результаты
+    const searchParams = new URLSearchParams();
+    const p = session.params;
+    if (p['location[okrug][]']) searchParams.append('location[okrug][]', p['location[okrug][]']);
+    if (p['metro[]']) searchParams.append('metro[]', p['metro[]']);
+    if (p['kitchen[]']) searchParams.append('kitchen[]', p['kitchen[]']);
+    if (p['middleCheck[from]']) searchParams.append('middleCheck[from]', p['middleCheck[from]']);
+    if (p['middleCheck[to]']) searchParams.append('middleCheck[to]', p['middleCheck[to]']);
+    if (p['opened_now']) searchParams.append('opened_now', 'on');
+    Object.keys(p).filter(k => k.startsWith('options[')).forEach(k => searchParams.append(k, p[k]));
+    searchParams.append('utm_campaign', 'tg_bot_ai');
+
+    const hasFilters = searchParams.toString().replace('utm_campaign=tg_bot_ai', '').replace('&', '').length > 0;
+    const collectionUrl = hasFilters
+      ? 'https://www.gdebar.ru/bars?' + searchParams.toString()
+      : 'https://www.gdebar.ru/luchshie-zavedeniya?' + barIds.map(id => 'barIds[]=' + id).join('&') + '&utm_campaign=tg_bot_ai';
+
     await ctx.reply(
       'Смотрите эти заведения на сайте — там полное меню, фото и форма бронирования:',
       Markup.inlineKeyboard([[
@@ -954,26 +1024,30 @@ const QUICK_COLS = {
 };
 
 bot.action(/^col_(.+)$/, async ctx => {
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery('Загружаю...');
   const key = ctx.match[1];
   const userId = ctx.from.id;
 
-  // Сначала проверяем быстрые коллекции по ключу
+  // Быстрые коллекции по ключу
   if (QUICK_COLS[key]) {
     sessions[userId] = { params: { ...QUICK_COLS[key].params }, page: 1, lastQuery: key };
     return await showResults(ctx, userId);
   }
 
-  // Потом ищем по label в COLLECTIONS
-  const label = decodeURIComponent(key);
-  const col = COLLECTIONS.find(c => c.label === label) || getTimeCollections().find(c => c.label === label);
-  if (col) {
-    const params = await buildCollectionParams(col);
-    sessions[userId] = { params, page: 1, lastQuery: label };
-    return await showResults(ctx, userId);
-  }
+  // По label в COLLECTIONS
+  try {
+    const label = decodeURIComponent(key);
+    const col = COLLECTIONS.find(c => c.label === label) || getTimeCollections().find(c => c.label === label);
+    if (col) {
+      const params = await buildCollectionParams(col);
+      sessions[userId] = { params, page: 1, lastQuery: label };
+      return await showResults(ctx, userId);
+    }
+  } catch(e) {}
 
-  await ctx.reply('Не удалось загрузить подборку. Попробуйте ещё раз.');
+  // Fallback — просто топ по рейтингу
+  sessions[userId] = { params: { 'sorting[rating]': 'desc' }, page: 1, lastQuery: 'Топ заведений' };
+  await showResults(ctx, userId);
 });
 
 // Геолокация
@@ -1169,6 +1243,14 @@ bot.on('text', async ctx => {
     console.log('Intent:', JSON.stringify(intent));
 
     if (intent.off_topic) {
+      // Если приветствие — отвечаем по-человечески
+      const greetings = ['привет', 'здравствуй', 'добрый', 'хай', 'hello', 'hi', 'салют', 'хэй'];
+      const isGreeting = greetings.some(g => text.toLowerCase().includes(g));
+      if (isGreeting) {
+        const { emoji, text: timeText } = getTimeGreeting();
+        await ctx.reply(emoji + ' ' + timeText + '! Чем могу помочь? Ищете ресторан или бар? 😊');
+        return;
+      }
       await ctx.reply(
         'Это немного не по моей части 😅\n\n' +
         'Я специализируюсь на ресторанах и барах. Но вот что могу предложить прямо сейчас:'
