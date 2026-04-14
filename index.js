@@ -211,9 +211,12 @@ async function parseIntent(userMessage) {
 function buildParams(intent) {
   const params = {};
   if (intent.venue_name) {
+    // Поиск по названию — только term, никаких других фильтров кроме города
     params['term'] = intent.venue_name;
-    // При поиске по названию не ограничиваем город — ресторан может быть в любом
     params['_isVenueSearch'] = true;
+    // Возвращаем сразу — не добавляем лишние фильтры
+    params['sorting[rating]'] = 'desc';
+    return params;
   }
   if (intent.metro_name) {
     const n = intent.metro_name.toLowerCase().trim();
@@ -279,10 +282,7 @@ function buildParams(intent) {
   if (intent.price_to)   params['middleCheck[to]']   = intent.price_to;
   if (intent.opened_now) params['opened_now'] = 'on';
   // Город — только если явно в запросе И сессия подтверждает
-  if (intent.city === 'spb' && !params['_isVenueSearch']) {
-    params['city'] = 'spb';
-  }
-  if (params['_isVenueSearch']) delete params['_isVenueSearch'];
+  if (intent.city === 'spb') params['city'] = 'spb';
 
   // Детские опции — пробуем найти конкретный подтип
   if (intent.kid_type && CACHE.kidOptions.length) {
@@ -1110,7 +1110,7 @@ bot.on('location', async ctx => {
 // ─── Основной обработчик ──────────────────────────────────────────────────────
 bot.on('text', async ctx => {
   const userId = ctx.from.id;
-  const text   = ctx.message.text;
+  let text   = ctx.message.text;
 
   // Выбор города — кнопки и текстовые синонимы
   const cityTextMsk = ['москва', 'moscow', 'мск'];
@@ -1225,9 +1225,16 @@ bot.on('text', async ctx => {
     delete p['metro[]'];
     const isSpb = sessions[userId]?.selectedCity === 'spb' || p['city'] === 'spb';
     if (isSpb) {
-      // Центральный район Петербурга
+      // Ищем центр Питера — пробуем найти в кэше, иначе через метро Невский проспект
       const centralSpb = CACHE.okrugSpb.find(o => o.name.toLowerCase().includes('центральн'));
-      if (centralSpb) p['location[okrug][]'] = centralSpb.id;
+      if (centralSpb) {
+        p['location[okrug][]'] = centralSpb.id;
+      } else {
+        // Фолбэк: ищем метро Невский проспект как центр
+        const nevsky = CACHE.metroSpb.find(m => m.name.toLowerCase().includes('невский'));
+        if (nevsky) { p['metro[]'] = nevsky.id; delete p['location[okrug][]']; }
+      }
+      p['city'] = 'spb';
       await ctx.reply('Ищу в центре Петербурга 🗺');
     } else {
       p['location[okrug][]'] = 11; // ЦАО Москва
