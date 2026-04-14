@@ -211,10 +211,8 @@ async function parseIntent(userMessage) {
 function buildParams(intent) {
   const params = {};
   if (intent.venue_name) {
-    // Поиск по названию — только term, никаких других фильтров кроме города
     params['term'] = intent.venue_name;
-    params['_isVenueSearch'] = true;
-    // Возвращаем сразу — не добавляем лишние фильтры
+    params['_venueName'] = intent.venue_name; // для пост-фильтрации
     params['sorting[rating]'] = 'desc';
     return params;
   }
@@ -279,7 +277,8 @@ function buildParams(intent) {
     }
   }
   if (intent.price_from) params['middleCheck[from]'] = intent.price_from;
-  if (intent.price_to)   params['middleCheck[to]']   = intent.price_to;
+  // Вычитаем 1 чтобы 'до 1000' было строгой верхней границей (не включая 1000)
+  if (intent.price_to)   params['middleCheck[to]']   = Math.max(0, intent.price_to - 1);
   if (intent.opened_now) params['opened_now'] = 'on';
   // Город — только если явно в запросе И сессия подтверждает
   if (intent.city === 'spb') params['city'] = 'spb';
@@ -756,7 +755,8 @@ async function showResults(ctx, userId) {
           if (hasValidPhoto(bar.photo_url)) { try { await ctx.replyWithPhoto(bar.photo_url, { caption: text, parse_mode: 'Markdown', ...kb }); continue; } catch(e) {} }
           await ctx.replyWithMarkdown(text, { disable_web_page_preview: true, ...kb });
         }
-        await ctx.reply('Нашлось ' + (retry.data.meta?.total||0) + ' заведений с расширенными параметрами.',
+        const retryTotal = retry.data.meta?.total || retryBars.length;
+        await ctx.reply('По расширенным параметрам нашлось ' + retryTotal + ' заведений 👆',
           Markup.keyboard([['📄 Показать ещё'],['💸 Подешевле','💎 Подороже'],['🔄 Новый поиск']]).resize());
         return;
       }
@@ -1226,13 +1226,18 @@ bot.on('text', async ctx => {
     const isSpb = sessions[userId]?.selectedCity === 'spb' || p['city'] === 'spb';
     if (isSpb) {
       // Ищем центр Питера — пробуем найти в кэше, иначе через метро Невский проспект
-      const centralSpb = CACHE.okrugSpb.find(o => o.name.toLowerCase().includes('центральн'));
-      if (centralSpb) {
-        p['location[okrug][]'] = centralSpb.id;
-      } else {
-        // Фолбэк: ищем метро Невский проспект как центр
-        const nevsky = CACHE.metroSpb.find(m => m.name.toLowerCase().includes('невский'));
-        if (nevsky) { p['metro[]'] = nevsky.id; delete p['location[okrug][]']; }
+      // Для центра Питера — ищем через метро Невский проспект (самый центральный)
+      // Окружная фильтрация СПб ненадёжна, метро работает точнее
+      delete p['location[okrug][]'];
+      const centralStations = ['невский проспект', 'гостиный двор', 'адмиралтейская', 'садовая'];
+      let centralMetro = null;
+      for (const st of centralStations) {
+        centralMetro = CACHE.metroSpb.find(m => m.name.toLowerCase().includes(st));
+        if (centralMetro) break;
+      }
+      if (centralMetro) {
+        p['metro[]'] = centralMetro.id;
+        p['distance'] = 1000; // в радиусе 1км от станции
       }
       p['city'] = 'spb';
       await ctx.reply('Ищу в центре Петербурга 🗺');
