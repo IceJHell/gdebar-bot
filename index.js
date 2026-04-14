@@ -26,7 +26,7 @@ async function apiGet(url, params, retries = 2) {
 }
 
 // ─── Справочники ──────────────────────────────────────────────────────────────
-let CACHE = { metros: [], kitchens: [], types: [], goodFor: [], kidOptions: [], okrugMsk: [], okrugSpb: [], metroSpb: [] };
+let CACHE = { metros: [], kitchens: [], types: [], goodFor: [], kidOptions: [], okrugMsk: [], okrugSpb: [], metroSpb: [], directions: [] };
 
 async function fetchOne(url, timeout = 60000) {
   const resp = await api.get(url, { timeout });
@@ -60,6 +60,7 @@ async function loadCache() {
     load('/kid-options', 'kidOptions'),
     load('/locations?type=okrug', 'okrugMsk'),
     load('/locations?type=okrug&city=spb', 'okrugSpb'),
+    load('/directions', 'directions'),
   ]);
   console.log('Итого:', { metros: CACHE.metros.length, kitchens: CACHE.kitchens.length, types: CACHE.types.length, goodFor: CACHE.goodFor.length });
 }
@@ -190,6 +191,7 @@ async function parseIntent(userMessage) {
       + '16. "из сети Novikov" / "Ginza" -> chain_name:"Novikov Group"\n'
       + '17. "ближайшие" / "рядом" -> sort:"nearest"\n'
       + '18. "новые" / "недавно открылось" -> sort:"newest", newest:true\n'
+      + 'ТИП ЗАВЕДЕНИЯ: "кафе" -> type:"кафе"; "ресторан" -> type:"ресторан"; "бар" -> type:"бар"; "кофейня" -> type:"кофейня"; "паб" -> type:"паб"; "клуб" -> type:"клуб" — это НЕ off_topic, это запрос типа заведения!\n'
       + 'ГОРОД: city:"spb" ТОЛЬКО если явно написано Санкт-Петербург/СПб/Питер/Петербург. Кузьминки, Арбатская, Тверская и т.д. — это МОСКВА. По умолчанию всегда Москва!\n'
       + 'confidence: 0.9+=чёткий, 0.6-0.9=понятно, 0.3-0.6=размытый(+clarify), 0-0.3=off_topic\n\n'
       + 'ВЕРНИ ТОЛЬКО JSON (только заполненные поля):\n'
@@ -206,15 +208,25 @@ async function parseIntent(userMessage) {
 // ─── Параметры ────────────────────────────────────────────────────────────────
 function buildParams(intent) {
   const params = {};
-  if (intent.venue_name) params['term'] = intent.venue_name;
+  if (intent.venue_name) {
+    params['term'] = intent.venue_name;
+    // При поиске по названию не ограничиваем город — ресторан может быть в любом
+    params['_isVenueSearch'] = true;
+  }
   if (intent.metro_name) {
     const n = intent.metro_name.toLowerCase().trim();
-    const metro = CACHE.metros.find(m => m.name.toLowerCase() === n)
-      || CACHE.metros.find(m => m.name.toLowerCase().startsWith(n))
-      || CACHE.metros.find(m => m.name.toLowerCase().includes(n))
-      || CACHE.metros.find(m => n.includes(m.name.toLowerCase()));
-    if (metro) params['metro[]'] = metro.id;
-    else params['_metroNotFound'] = intent.metro_name;
+    const allMetros = [...CACHE.metros, ...CACHE.metroSpb];
+    const metro = allMetros.find(m => m.name.toLowerCase() === n)
+      || allMetros.find(m => m.name.toLowerCase().startsWith(n))
+      || allMetros.find(m => m.name.toLowerCase().includes(n))
+      || allMetros.find(m => n.includes(m.name.toLowerCase()));
+    if (metro) {
+      params['metro[]'] = metro.id;
+      // Если станция питерская — автоматически добавляем город
+      if (CACHE.metroSpb.some(m => m.id === metro.id)) params['city'] = 'spb';
+    } else {
+      params['_metroNotFound'] = intent.metro_name;
+    }
   }
   if (intent.kitchen) { const k = CACHE.kitchens.find(x => x.name.toLowerCase().includes(intent.kitchen.toLowerCase())); if (k) params['kitchen[]'] = k.id; }
   if (intent.type) { const t = CACHE.types.find(x => x.name.toLowerCase().includes(intent.type.toLowerCase())); if (t) params['type[]'] = t.id; }
@@ -226,12 +238,12 @@ function buildParams(intent) {
   if (intent.good_for) { const gf = CACHE.goodFor.find(x => x.name.toLowerCase().includes(intent.good_for.toLowerCase())); if (gf) params['good_for[]'] = gf.id; }
   // Направление кухни
   if (intent.direction) {
-    const d = CACHE.kitchens.find(x => x.name.toLowerCase().includes(intent.direction.toLowerCase()));
+    const d = CACHE.directions.find(x => x.name.toLowerCase().includes(intent.direction.toLowerCase()));
     if (d) params['direction[]'] = d.id;
   }
   // Поиск по блюду
   if (Array.isArray(intent.food) && intent.food.length) {
-    intent.food.forEach((f, i) => { params['food[' + i + ']'] = f; });
+    intent.food.forEach(f => { params['food[]'] = f; }); // API expects food[]
   }
   // Расстояние до метро
   if (intent.metro_distance) params['distance'] = intent.metro_distance;
@@ -265,10 +277,10 @@ function buildParams(intent) {
   if (intent.price_to)   params['middleCheck[to]']   = intent.price_to;
   if (intent.opened_now) params['opened_now'] = 'on';
   // Город — только если явно в запросе И сессия подтверждает
-  if (intent.city === 'spb') {
-    // Дополнительная проверка — должно быть явное упоминание
+  if (intent.city === 'spb' && !params['_isVenueSearch']) {
     params['city'] = 'spb';
   }
+  if (params['_isVenueSearch']) delete params['_isVenueSearch'];
 
   // Детские опции — пробуем найти конкретный подтип
   if (intent.kid_type && CACHE.kidOptions.length) {
@@ -374,7 +386,7 @@ function getTimeCollections() {
 const COLLECTIONS = [
   { label: '⭐ Топ Москвы',          params: { 'sorting[rating]': 'desc' } },
   { label: '🆕 Новинки',             params: { newest: 1, 'sorting[rating]': 'desc' } },
-  { label: '🌿 Здоровое питание',    params: { 'options[sushi]': 'on', 'sorting[rating]': 'desc' } },
+  { label: '🌿 Здоровое питание',    params: { 'sorting[rating]': 'desc' }, goodFor: 'здоров' },
   { label: '🎭 Шоу и развлечения',   params: { 'options[show]': 'on', 'options[live_music]': 'on', 'sorting[rating]': 'desc' } },
   { label: '🍜 Азия',                params: { 'sorting[rating]': 'desc' }, kitchens: ['Японская','Китайская','Корейская','Тайская'] },
   { label: '🥩 Мясо и огонь',        params: { 'sorting[rating]': 'desc' }, type: 'стейк' },
@@ -399,7 +411,7 @@ async function buildCollectionParams(col) {
       const k = CACHE.kitchens.find(x => x.name.toLowerCase().includes(name.toLowerCase()));
       return k ? k.id : null;
     }).filter(Boolean);
-    if (ids.length) params['kitchen[]'] = ids[0]; // берём первую для простоты
+    if (ids.length) params['kitchen[]'] = ids; // передаём все ID кухонь
   }
   // good_for
   if (col.goodFor) {
@@ -545,9 +557,9 @@ function barInlineKeyboard(bar) {
   if (bar.url) row1.push(Markup.button.url('🌐 На сайте', bar.url));
   if (base && bar.has_menu) row1.push(Markup.button.url('🍽 Меню', base + '/menu'));
   if (base && bar.reviews_count > 0) row2.push(Markup.button.url('💬 Отзывы (' + bar.reviews_count + ')', base + '/otzyvy'));
-  // Карта — на страницу заведения, там есть карта + клик остаётся у GdeBar
+  // Карта — карточка на сайте с якорем #map, клик засчитывается + человек видит карту и навигатор
   if (bar.url) {
-    const mapUrl = cleanUrl(bar.url) + '#map';
+    const mapUrl = cleanUrl(bar.url) + '?utm_campaign=tg_bot_ai#map';
     row2.push(Markup.button.url('🗺 На карте', mapUrl));
   }
   row2.push(Markup.button.callback('❤️ В избранное', 'fav_' + bar.id));
@@ -856,7 +868,7 @@ async function showResults(ctx, userId) {
 
     const hasFilters = searchParams.toString().replace('utm_campaign=tg_bot_ai', '').replace('&', '').length > 0;
     const collectionUrl = hasFilters
-      ? 'https://www.gdebar.ru/bars?' + searchParams.toString()
+      ? 'https://www.gdebar.ru/luchshie-zavedeniya?' + searchParams.toString()
       : 'https://www.gdebar.ru/luchshie-zavedeniya?' + barIds.map(id => 'barIds[]=' + id).join('&') + '&utm_campaign=tg_bot_ai';
 
     await ctx.reply(
@@ -899,7 +911,33 @@ bot.start(async ctx => {
   );
 });
 
-bot.help(ctx => ctx.reply('Напишите что ищете или выберите подборку.\nМожно указать: метро, кухню, бюджет, особенности.'));
+bot.command('wizard', async ctx => {
+  const userId = ctx.from.id;
+  wizards[userId] = { step: 0, answers: {} };
+  await runWizard(ctx, userId);
+});
+
+bot.command('new', async ctx => {
+  const userId = ctx.from.id;
+  const savedCity = sessions[userId]?.selectedCity;
+  delete sessions[userId];
+  if (savedCity) sessions[userId] = { selectedCity: savedCity };
+  await ctx.reply('Хорошо, начнём заново. Что ищете?', mainKeyboard());
+});
+
+bot.help(ctx => ctx.replyWithMarkdown(
+  '*Как пользоваться:*\n\n' +
+  '🔍 Напишите запрос: «Грузинский ресторан у Арбатской до 2000»\n' +
+  '📍 *Рядом со мной* — заведения по геолокации\n' +
+  '🗂 *Подборки* — готовые тематические коллекции\n' +
+  '🤔 *5 вопросов* — пошаговый подбор\n\n' +
+  '*Команды:*\n' +
+  '/start — начать заново\n' +
+  '/wizard — пошаговый подбор\n' +
+  '/favorites — избранное\n' +
+  '/new — новый поиск\n' +
+  '/report — отчёт (для администратора)'
+));
 
 // /favorites
 bot.command('favorites', async ctx => {
@@ -1040,7 +1078,10 @@ bot.action(/^col_(.+)$/, async ctx => {
     const col = COLLECTIONS.find(c => c.label === label) || getTimeCollections().find(c => c.label === label);
     if (col) {
       const params = await buildCollectionParams(col);
-      sessions[userId] = { params, page: 1, lastQuery: label };
+      // Добавляем город из сессии пользователя
+      const selectedCity = sessions[userId]?.selectedCity || sessions[userId]?.city;
+      if (selectedCity === 'spb') params['city'] = 'spb';
+      sessions[userId] = { params, page: 1, lastQuery: label, selectedCity };
       return await showResults(ctx, userId);
     }
   } catch(e) {}
@@ -1067,8 +1108,15 @@ bot.on('text', async ctx => {
   const userId = ctx.from.id;
   const text   = ctx.message.text;
 
-  // Выбор города
-  if (text === '🏙 Москва' || text === '🌊 Санкт-Петербург') {
+  // Выбор города — кнопки и текстовые синонимы
+  const cityTextMsk = ['москва', 'moscow', 'мск'];
+  const cityTextSpb = ['санкт-петербург', 'питер', 'спб', 'спб', 'saint-petersburg', 'петербург', 'ленинград'];
+  const isMskText = cityTextMsk.some(c => text.toLowerCase().trim() === c);
+  const isSpbText = cityTextSpb.some(c => text.toLowerCase().trim() === c);
+
+  if (text === '🏙 Москва' || isMskText || text === '🌊 Санкт-Петербург' || isSpbText) {
+    if (isMskText && text !== '🏙 Москва') text = '🏙 Москва';
+    if (isSpbText && text !== '🌊 Санкт-Петербург') text = '🌊 Санкт-Петербург';
     const city = text === '🌊 Санкт-Петербург' ? 'spb' : 'msk';
     // Явно фиксируем город в сессии — для Москвы НЕ передаём city (по умолчанию Москва)
     sessions[userId] = { params: city === 'spb' ? { city: 'spb' } : {}, page: 1, lastQuery: '', city };
@@ -1232,7 +1280,9 @@ bot.on('text', async ctx => {
   }
 
   if (text === '🔄 Новый поиск') {
+    const savedCity = sessions[userId]?.selectedCity;
     delete sessions[userId];
+    if (savedCity) sessions[userId] = { selectedCity: savedCity };
     return ctx.reply('Хорошо, начнём заново. Что ищете?', mainKeyboard());
   }
 
@@ -1266,7 +1316,7 @@ bot.on('text', async ctx => {
       return ctx.reply('🤔 ' + intent.clarify, Markup.keyboard([['❌ Отмена'],['🔄 Новый поиск']]).resize());
     }
 
-    if ((intent.confidence || 1) < 0.4) {
+    if ((intent.confidence || 1) < 0.35) {
       await ctx.reply(
         'Не совсем понял запрос 🤔\n\n' +
         'Попробуйте написать иначе, например:\n' +
