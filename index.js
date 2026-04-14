@@ -66,7 +66,7 @@ async function loadCache() {
 }
 
 // ─── Избранное (Feature 1) ────────────────────────────────────────────────────
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp'; // /tmp works on Railway, use Volume for persistence
 const FAV_FILE = path.join(DATA_DIR, 'favorites.json');
 
 function loadFavorites() {
@@ -177,7 +177,8 @@ async function parseIntent(userMessage) {
       + '2. "нас двое, атмосферно" -> good_for:романтика\n'
       + '3. "на обед" -> options:[lunch], price_to:1200\n'
       + '4. "с детьми" -> options:[kid]\n'
-      + '5. "бюджетно" -> price_to:1200; "средний" -> price_to:2500; "дорогой" -> price_from:3000\n'
+      + '5. "бюджетно"/"недорого" -> price_to:1200; "средний" -> price_to:2500; "дорогой" -> price_from:3000\n'
+      + '   "до 500" -> price_to:500; "до 800" -> price_to:800; "до 1000" -> price_to:1000; "до 1500" -> price_to:1500; "до 2000" -> price_to:2000; "до 3000" -> price_to:3000\n'
       + '6. МЕТРО: бери точно как написал пользователь\n'
       + '7. "в 5 минутах от метро" / "рядом с метро" -> metro_distance:500\n'
       + '8. "где поесть борщ" / "хочу стейк" -> food:["Борщ"] или food:["Стейк"]\n'
@@ -191,7 +192,8 @@ async function parseIntent(userMessage) {
       + '16. "из сети Novikov" / "Ginza" -> chain_name:"Novikov Group"\n'
       + '17. "ближайшие" / "рядом" -> sort:"nearest"\n'
       + '18. "новые" / "недавно открылось" -> sort:"newest", newest:true\n'
-      + 'ТИП ЗАВЕДЕНИЯ: "кафе" -> type:"кафе"; "ресторан" -> type:"ресторан"; "бар" -> type:"бар"; "кофейня" -> type:"кофейня"; "паб" -> type:"паб"; "клуб" -> type:"клуб" — это НЕ off_topic, это запрос типа заведения!\n'
+      + 'ТИП ЗАВЕДЕНИЯ: "кафе" -> type:"кафе"; "ресторан" -> type:"ресторан"; "бар" -> type:"бар"; "кофейня" -> type:"кофейня"; "паб" -> type:"паб"; "клуб" -> type:"клуб" — это НЕ off_topic!\n'
+      + 'ПОИСК ПО НАЗВАНИЮ: если есть конкретное имя заведения (Пушкинъ, Сиксти, White Rabbit) -> venue_name. НЕ путай с городами! Пушкинъ — это ресторан, НЕ город Пушкино!\n'
       + 'ГОРОД: city:"spb" ТОЛЬКО если явно написано Санкт-Петербург/СПб/Питер/Петербург. Кузьминки, Арбатская, Тверская и т.д. — это МОСКВА. По умолчанию всегда Москва!\n'
       + 'confidence: 0.9+=чёткий, 0.6-0.9=понятно, 0.3-0.6=размытый(+clarify), 0-0.3=off_topic\n\n'
       + 'ВЕРНИ ТОЛЬКО JSON (только заполненные поля):\n'
@@ -907,7 +909,9 @@ bot.start(async ctx => {
     '🎯 *Пошаговый подбор* — отвечаете на 3 вопроса, я подбираю точно\n\n' +
     '❤️ *Избранное* — сохраняйте понравившиеся заведения\n\n' +
     'С какого города начнём?',
-    Markup.keyboard([['🏙 Москва', '🌊 Санкт-Петербург']]).resize()
+    Markup.keyboard([
+      ['🏙 Москва', '🌊 Санкт-Петербург'],
+    ]).oneTime().resize()
   );
 });
 
@@ -1219,9 +1223,17 @@ bot.on('text', async ctx => {
   if (text === '📍 Ближе к центру' && sessions[userId]) {
     const p = { ...sessions[userId].params };
     delete p['metro[]'];
-    p['location[okrug][]'] = 11; // ЦАО
+    const isSpb = sessions[userId]?.selectedCity === 'spb' || p['city'] === 'spb';
+    if (isSpb) {
+      // Центральный район Петербурга
+      const centralSpb = CACHE.okrugSpb.find(o => o.name.toLowerCase().includes('центральн'));
+      if (centralSpb) p['location[okrug][]'] = centralSpb.id;
+      await ctx.reply('Ищу в центре Петербурга 🗺');
+    } else {
+      p['location[okrug][]'] = 11; // ЦАО Москва
+      await ctx.reply('Ищу в центре Москвы (ЦАО) 🗺');
+    }
     sessions[userId] = { ...sessions[userId], params: p, page: 1 };
-    await ctx.reply('Ищу в центре (ЦАО) 🗺');
     return await showResults(ctx, userId);
   }
 
@@ -1293,12 +1305,19 @@ bot.on('text', async ctx => {
     console.log('Intent:', JSON.stringify(intent));
 
     if (intent.off_topic) {
-      // Если приветствие — отвечаем по-человечески
+      // Если приветствие
       const greetings = ['привет', 'здравствуй', 'добрый', 'хай', 'hello', 'hi', 'салют', 'хэй'];
       const isGreeting = greetings.some(g => text.toLowerCase().includes(g));
       if (isGreeting) {
         const { emoji, text: timeText } = getTimeGreeting();
         await ctx.reply(emoji + ' ' + timeText + '! Чем могу помочь? Ищете ресторан или бар? 😊');
+        return;
+      }
+      // Если упомянут город вне базы
+      const otherCities = ['тбилиси', 'ереван', 'алматы', 'баку', 'минск', 'киев', 'варшава', 'берлин', 'париж', 'лондон', 'дубай'];
+      const mentionsOtherCity = otherCities.some(c => text.toLowerCase().includes(c));
+      if (mentionsOtherCity) {
+        await ctx.reply('К сожалению, работаю только с заведениями Москвы и Санкт-Петербурга 🗺\n\nЕсли планируете поездку в Москву или Питер — помогу найти лучшие места!', mainKeyboard());
         return;
       }
       await ctx.reply(
